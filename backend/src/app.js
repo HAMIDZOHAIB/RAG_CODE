@@ -6,6 +6,7 @@ import pool from "../config/db.js";
 import websiteDataRouter from "./routes/websiteData.js";
 import queryRouter from "./routes/query.js";
 import bodyParser from "body-parser";
+import agentRouter from "./routes/agent.route.js"; 
 
 dotenv.config();
 
@@ -25,7 +26,7 @@ app.use(bodyParser.json({ limit: "50mb" }));
 // Routes
 app.use("/api/website-data", websiteDataRouter);
 app.use("/api/query", queryRouter);
-
+app.use("/api", agentRouter);
 // Root route
 app.get("/", (req, res) => {
   res.send("Server is running 🚀");

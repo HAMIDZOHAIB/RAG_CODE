@@ -1,28 +1,22 @@
-import { exec } from "child_process";
+import axios from "axios";
 
 export const agentController = async (req, res) => {
   try {
     const { query } = req.body;
-
     if (!query) {
       return res.status(400).json({ error: "query is required" });
     }
 
-    console.log("🤖 Agent received query:", query);
+    console.log("🤖 AgentController received query:", query);
 
-    // Call your python scraper
-    exec(`python main.py "${query}"`, (error, stdout, stderr) => {
-      if (error) {
-        console.error("Python error:", error);
-        return res.status(500).json({ error: "Agent failed to scrape" });
-      }
+    // Call FastAPI
+    const response = await axios.post("http://localhost:8000/scrape", { query }, { timeout: 60000 });
 
-      console.log("Scraper output:", stdout);
-      return res.json({ message: "Agent scraping completed" });
-    });
+    console.log("✅ FastAPI response received:", response.data);
+    res.json(response.data);
 
   } catch (err) {
-    console.error("agentController error:", err);
-    res.status(500).json({ error: "Agent internal error" });
+    console.error("agentController error:", err.message);
+    res.status(500).json({ error: "Agent internal error", details: err.response?.data || err.message });
   }
 };
