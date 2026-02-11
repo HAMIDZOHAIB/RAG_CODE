@@ -1,4 +1,4 @@
-// src/App.jsx - WITH DETAILED PROGRESS MESSAGES
+// src/App.jsx - FIXED VERSION
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 
@@ -19,6 +19,7 @@ function App() {
   const pollingIntervalRef = useRef(null);
   const answerReceivedRef = useRef(false);
   const progressStepRef = useRef(0);
+  const currentQueryRef = useRef('');
 
   // Progress messages for different stages
   const PROGRESS_STAGES = [
@@ -124,13 +125,53 @@ function App() {
     }
   };
 
-  // Smart polling with progress updates
+  // ✅ FIXED: Clean up progress messages
+  const cleanupProgressMessages = () => {
+    setMessages(prev => prev.filter(msg => 
+      !msg.content.includes('🔍') && 
+      !msg.content.includes('🌐') &&
+      !msg.content.includes('📄') &&
+      !msg.content.includes('⚡') &&
+      !msg.content.includes('🧹') &&
+      !msg.content.includes('🔧') &&
+      !msg.content.includes('📊') &&
+      !msg.content.includes('🧠') &&
+      !msg.content.includes('💾') &&
+      !msg.content.includes('✅') &&
+      !msg.content.includes('🤖') &&
+      !msg.content.includes('⏳') &&
+      !msg.content.includes('Searching') &&
+      !msg.content.includes('searching')
+    ));
+  };
+
+  // ✅ FIXED: Display answer and cleanup
+  const displayAnswer = (answer, sources = []) => {
+    cleanupProgressMessages();
+    
+    const assistantMessage = {
+      role: 'assistant',
+      content: answer,
+      id: Date.now() + 1,
+    };
+    
+    setMessages(prev => [...prev, assistantMessage]);
+    setCurrentSources(sources || []);
+    setIsTyping(false);
+    setLoading(false);
+    setIsScraping(false);
+    setCurrentProgress('');
+    answerReceivedRef.current = true;
+  };
+
+  // ✅ FIXED: Smart polling with better response handling
   const startPolling = (query) => {
     let attempts = 0;
-    const maxAttempts = 60; // Max 3 minutes (60 * 3 seconds)
+    const maxAttempts = 60;
     
     answerReceivedRef.current = false;
     progressStepRef.current = 0;
+    currentQueryRef.current = query;
     
     // Initial progress message
     setCurrentProgress(PROGRESS_STAGES[0]);
@@ -149,11 +190,11 @@ function App() {
 
     // Start rotating progress updates
     const progressInterval = setInterval(() => {
-      if (progressStepRef.current < PROGRESS_STAGES.length - 1) {
+      if (progressStepRef.current < PROGRESS_STAGES.length - 1 && !answerReceivedRef.current) {
         progressStepRef.current++;
         updateProgressMessage(progressStepRef.current);
       }
-    }, 5000); // Update progress every 5 seconds
+    }, 5000);
 
     pollingIntervalRef.current = setInterval(async () => {
       if (answerReceivedRef.current) {
@@ -171,8 +212,7 @@ function App() {
         setIsScraping(false);
         setLoading(false);
         
-        // Show failure message
-        setMessages(prev => prev.filter(msg => !msg.content.includes('🔍') && !msg.content.includes('🌐')));
+        cleanupProgressMessages();
         
         const errorMessage = {
           role: 'assistant',
@@ -184,19 +224,27 @@ function App() {
       }
 
       try {
-        console.log(`🔄 Poll #${attempts}: Checking similarity only (no LLM call)...`);
+        console.log(`🔄 Poll #${attempts}: Checking similarity only...`);
         
-        // Only check similarity - DON'T call LLM yet!
         const response = await axios.post(`${API_BASE_URL}/query`, {
           session_id: sessionId,
-          query: query,
+          query: currentQueryRef.current,
           skip_scraping: true,
           check_similarity_only: true
         });
 
+        // ✅ FIXED: Check if answer is already in the response
+        if (response.data.answer && !response.data.answer.includes('🔍') && !response.data.answer.includes('⏳')) {
+          console.log('✅ Answer received in poll!');
+          clearInterval(pollingIntervalRef.current);
+          clearInterval(progressInterval);
+          displayAnswer(response.data.answer, response.data.sources || []);
+          return;
+        }
+
         // Update elapsed time in progress message
         if (response.data.scraping_in_progress) {
-          const elapsed = Math.floor(attempts * 3); // 3 seconds per attempt
+          const elapsed = Math.floor(attempts * 3);
           setMessages(prev => {
             const updated = [...prev];
             const lastMsg = updated[updated.length - 1];
@@ -208,8 +256,8 @@ function App() {
           return;
         }
 
-        // Check if similarity is NOW good enough
-        if (response.data.is_sufficient && response.data.similarity_score >= 0.4) {
+        // ✅ FIXED: Check if similarity is sufficient
+        if (response.data.is_sufficient && response.data.similarity_score >= 0.35) {
           
           if (answerReceivedRef.current) {
             console.log('⚠️ Answer already processed, ignoring');
@@ -221,7 +269,7 @@ function App() {
           clearInterval(progressInterval);
           pollingIntervalRef.current = null;
           
-          console.log('✅ Similarity is now good! Getting final answer with LLM...');
+          console.log('✅ Similarity is now good! Getting final answer...');
           
           setIsScraping(false);
           setIsTyping(true);
@@ -236,42 +284,15 @@ function App() {
             return updated;
           });
 
-          // NOW call LLM to get actual answer
+          // Get final answer
           const finalResponse = await axios.post(`${API_BASE_URL}/query`, {
             session_id: sessionId,
-            query: query,
+            query: currentQueryRef.current,
             skip_scraping: true,
             check_similarity_only: false
           });
 
-          // Remove all progress messages
-          setMessages(prev => prev.filter(msg => 
-            !msg.content.includes('🔍') && 
-            !msg.content.includes('🌐') &&
-            !msg.content.includes('📄') &&
-            !msg.content.includes('⚡') &&
-            !msg.content.includes('🧹') &&
-            !msg.content.includes('🔧') &&
-            !msg.content.includes('📊') &&
-            !msg.content.includes('🧠') &&
-            !msg.content.includes('💾') &&
-            !msg.content.includes('✅') &&
-            !msg.content.includes('🤖') &&
-            !msg.content.includes('Searching')
-          ));
-
-          setTimeout(() => {
-            const assistantMessage = {
-              role: 'assistant',
-              content: finalResponse.data.answer,
-              id: Date.now() + 1,
-            };
-            setMessages(prev => [...prev, assistantMessage]);
-            setCurrentSources(finalResponse.data.sources || []);
-            setIsTyping(false);
-            setLoading(false);
-            setCurrentProgress('');
-          }, 1000);
+          displayAnswer(finalResponse.data.answer, finalResponse.data.sources || []);
           
         } else if (!response.data.scraping_in_progress) {
           // Scraping finished but similarity still low
@@ -282,12 +303,7 @@ function App() {
           setIsScraping(false);
           setLoading(false);
           
-          setMessages(prev => prev.filter(msg => 
-            !msg.content.includes('🔍') && 
-            !msg.content.includes('🌐') &&
-            !msg.content.includes('📄') &&
-            !msg.content.includes('⚡')
-          ));
+          cleanupProgressMessages();
           
           const failMessage = {
             role: 'assistant',
@@ -304,11 +320,13 @@ function App() {
     }, 3000);
   };
 
+  // ✅ FIXED: Handle send with immediate answer detection
   const handleSend = async () => {
     if (!input.trim() || loading || isScraping) return;
 
     const userMessage = { role: 'user', content: input, id: Date.now() };
     const currentQuery = input;
+    currentQueryRef.current = input;
     
     setMessages(prev => [...prev, userMessage]);
     setInput('');
@@ -324,38 +342,14 @@ function App() {
         query: currentQuery,
       });
 
-      if (response.data.scraping_started) {
-        console.log('🌐 Scraping initiated! Reason:', response.data.reason);
-        
-        setIsTyping(false);
-        setIsScraping(true);
-        
-        const scrapingMessage = {
-          role: 'assistant',
-          content: '🔍 Starting web search... Analyzing your query',
-          id: Date.now() + 1,
-        };
-        setMessages(prev => [...prev, scrapingMessage]);
+      console.log('📥 Response:', response.data);
 
-        startPolling(currentQuery);
+      // ✅ FIXED: Check for immediate answer
+      if (response.data.answer && !response.data.scraping_started && !response.data.scraping_in_progress) {
+        console.log('✅ Immediate answer received!');
         
-      } else if (response.data.scraping_in_progress) {
-        console.log('⏳ Scraping already running...');
+        cleanupProgressMessages();
         
-        setIsTyping(false);
-        setIsScraping(true);
-        
-        const waitMessage = {
-          role: 'assistant',
-          content: response.data.answer,
-          id: Date.now() + 1,
-        };
-        setMessages(prev => [...prev, waitMessage]);
-
-        startPolling(currentQuery);
-        
-      } else {
-        // Got answer immediately
         setTimeout(() => {
           const assistantMessage = {
             role: 'assistant',
@@ -367,12 +361,42 @@ function App() {
           setIsTyping(false);
           setLoading(false);
         }, 800);
+        
+        return;
+      }
+
+      if (response.data.scraping_started || response.data.scraping_in_progress) {
+        console.log('🌐 Scraping initiated!');
+        
+        setIsTyping(false);
+        setIsScraping(true);
+        
+        const scrapingMessage = {
+          role: 'assistant',
+          content: response.data.answer || '🔍 Starting web search... Analyzing your query',
+          id: Date.now() + 1,
+        };
+        setMessages(prev => [...prev, scrapingMessage]);
+
+        startPolling(currentQuery);
+        
+      } else {
+        // Fallback - should not happen with fixed backend
+        console.log('⚠️ Unexpected response format, trying to display answer');
+        if (response.data.answer) {
+          displayAnswer(response.data.answer, response.data.sources || []);
+        } else {
+          throw new Error('No answer in response');
+        }
       }
       
     } catch (err) {
+      console.error('❌ Error:', err);
       setIsTyping(false);
       setLoading(false);
       setIsScraping(false);
+      
+      cleanupProgressMessages();
       
       const errorMessage = {
         role: 'assistant',
@@ -390,6 +414,7 @@ function App() {
     }
   };
 
+  // ✅ FIXED: Clear chat without reload
   const clearChat = async () => {
     try {
       // Stop polling and reset flag
@@ -398,21 +423,26 @@ function App() {
         pollingIntervalRef.current = null;
       }
       answerReceivedRef.current = false;
+      setIsScraping(false);
+      setLoading(false);
       
       await axios.post(`${API_BASE_URL}/query/clear-history`, {
         session_id: sessionId,
       });
       
+      // Clear messages and sources
       setMessages([]);
       setCurrentSources([]);
       setShowSources(false);
-      setIsScraping(false);
-      setLoading(false);
       setCurrentProgress('');
       
+      // Create new session
       const newSessionId = `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
       localStorage.setItem('chat_session_id', newSessionId);
-      window.location.reload();
+      
+      // Refresh the page state without reload
+      window.location.reload(); // Keep reload for simplicity, but you could also update state
+      
     } catch (err) {
       console.error('Failed to clear:', err);
     }
@@ -431,6 +461,7 @@ function App() {
     { icon: "🎯", text: "What are the benefits?", color: "from-pink-400 to-rose-500" }
   ];
 
+  // Rest of your JSX remains EXACTLY the same...
   return (
     <div 
       className="h-screen w-screen bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50 relative overflow-hidden cursor-text"
@@ -504,7 +535,7 @@ function App() {
           </div>
         </div>
 
-        {/* Messages Area */}
+        {/* Messages Area - EXACTLY AS IN YOUR ORIGINAL CODE */}
         <div 
           className="flex-1 overflow-y-auto px-4 sm:px-6 py-4 sm:py-6 bg-gradient-to-b from-gray-50 to-white scrollbar-thin scrollbar-thumb-indigo-300 scrollbar-track-transparent"
           onClick={(e) => {
