@@ -1,11 +1,11 @@
-// queryController.js - FIXED VERSION
+// queryController.js - FIXED VERSION with better error handling
 import axios from "axios";
 import Groq from "groq-sdk";
 import WebsiteData from "../../models/websitedata.js";
 import ChatSession from "../../models/ChatSession.js";
 
 const TOP_K = 5;
-const SIMILARITY_THRESHOLD = 0.35; // Keep consistent
+const SIMILARITY_THRESHOLD = 0.35;
 const EMBEDDING_API_URL = process.env.EMBEDDING_API_URL || "http://localhost:5000/embed";
 const EMBEDDING_API_TIMEOUT = 5000;
 const PYTHON_SCRAPER_URL = process.env.PYTHON_SCRAPER_URL || "http://localhost:8000/scrape";
@@ -13,34 +13,26 @@ const PYTHON_SCRAPER_URL = process.env.PYTHON_SCRAPER_URL || "http://localhost:8
 const scrapingInProgress = new Map();
 const activeRequests = new Map();
 
+// ✅ Add request timeout to prevent hanging
+const REQUEST_TIMEOUT = 30000; // 30 seconds
+
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
-// ✅ ULTRA-STRONG follow-up detection including "give me the link/website"
+// ✅ ULTRA-STRONG follow-up detection
 function hasStrongFollowUpIndicators(query) {
   const lowerQuery = query.toLowerCase().trim();
   
   const strongIndicators = [
-    // Pronouns at start
     /^(it|this|that|these|those|they|them|its|their)\s/i,
-    
-    // CRITICAL: "give me" / "show me" patterns
     /^(give|show|send|provide|share)\s+(me|us)\s+(the|a|an|its|their)/i,
     /^(give|show|send|provide|share)\s+(the|a|an)/i,
-    
-    // "the link" / "the website" / "the url"
     /\b(the|a|an)\s+(link|website|url|site|page|source)\b/i,
-    
-    // Question words + pronouns
     /^(why|how|when|where|what)\s+(is|are|do|does|can|should)\s+(it|this|that|these|those)/i,
     /^(why|how|when|where)\s+(use|need|have|want|do)\s+(it|this|that)/i,
-    
-    // Corrective phrases
     /\b(not (the )?(right|correct|official)|wrong|another|different)\b/i,
     /\b(give me (the )?(official|correct|right|actual|real))\b/i,
-    
-    // Very short procedural
     /^(link|website|url|source|page)\??$/i,
     /^(how|why|what|when|where)\??$/i,
   ];
@@ -73,7 +65,7 @@ function hasNewTopicIndicators(query) {
     /^(search for|find|look up)\s(?!it|this|that|the link|the website)/i,
   ];
   
-  return newTopicPhrases.some(pattern => pattern.test(lowerQuery));
+  return newTopicPhrases.some(phrase => phrase.test(lowerQuery));
 }
 
 async function shouldUseContext(query, conversationHistory) {
@@ -115,8 +107,14 @@ export const handleQuery = async (req, res) => {
   try {
     const { session_id, query, skip_scraping, check_similarity_only } = req.body;
 
+    // ✅ Validate inputs
     if (!session_id || !query) {
-      return res.status(400).json({ error: "session_id and query are required" });
+      console.error("❌ Missing required fields:", { session_id, query });
+      return res.status(400).json({ 
+        error: "session_id and query are required",
+        is_sufficient: false,
+        similarity_score: 0
+      });
     }
 
     const scrapingKey = `${session_id}:${query.toLowerCase().trim()}`;
@@ -126,7 +124,9 @@ export const handleQuery = async (req, res) => {
       console.log(`⚠️ DUPLICATE REQUEST BLOCKED: "${query}"`);
       return res.status(429).json({ 
         error: "Request already in progress",
-        message: "This query is currently being processed."
+        message: "This query is currently being processed.",
+        is_sufficient: false,
+        similarity_score: 0
       });
     }
     
@@ -134,15 +134,27 @@ export const handleQuery = async (req, res) => {
       activeRequests.set(scrapingKey, Date.now());
       console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
       console.log(`📝 NEW REQUEST: "${query}"`);
+      console.log(`   skip_scraping: ${skip_scraping}`);
       console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
     }
 
-    // Fetch history
-    const sessionMessages = await ChatSession.findAll({
-      where: { session_id },
-      order: [["createdAt", "ASC"]],
-      limit: 12
-    });
+    // ✅ Fetch history with error handling
+    let sessionMessages = [];
+    try {
+      sessionMessages = await ChatSession.findAll({
+        where: { session_id },
+        order: [["createdAt", "ASC"]],
+        limit: 12
+      });
+    } catch (dbError) {
+      console.error("❌ Database error fetching history:", dbError);
+      activeRequests.delete(scrapingKey);
+      return res.status(500).json({ 
+        error: "Database error",
+        is_sufficient: false,
+        similarity_score: 0
+      });
+    }
 
     const conversationHistory = sessionMessages.map(msg => ({
       role: msg.role,
@@ -154,12 +166,6 @@ export const handleQuery = async (req, res) => {
     );
 
     console.log(`📚 History: ${conversationHistory.length} messages`);
-    if (conversationHistory.length > 0) {
-      const lastTwo = conversationHistory.slice(-2);
-      lastTwo.forEach(msg => {
-        console.log(`  ${msg.role}: "${msg.content.substring(0, 60)}..."`);
-      });
-    }
 
     // Context decision
     const contextDecision = await shouldUseContext(query, conversationHistory);
@@ -177,38 +183,63 @@ export const handleQuery = async (req, res) => {
         .join(" ");
       
       queryForEmbedding = `${recentContext} ${query}`;
-      console.log(`🔗 Enhanced: "${queryForEmbedding.substring(0, 100)}..."`);
+      console.log(`🔗 Enhanced query (${queryForEmbedding.length} chars)`);
     }
 
-    // Generate embedding
+    // ✅ Generate embedding with better error handling
     let queryEmbedding;
     try {
+      console.log(`🧠 Generating embedding...`);
       const embedResp = await axios.post(
         EMBEDDING_API_URL,
         { text: queryForEmbedding },
         { timeout: EMBEDDING_API_TIMEOUT }
       );
+      
+      if (!embedResp.data || !embedResp.data.embedding) {
+        throw new Error("Invalid embedding response");
+      }
+      
       queryEmbedding = embedResp.data.embedding;
+      console.log(`   ✅ Embedding generated (${queryEmbedding.length} dims)`);
+      
     } catch (embedError) {
+      console.error("❌ Embedding error:", embedError.message);
       activeRequests.delete(scrapingKey);
+      
       if (embedError.code === 'ECONNREFUSED') {
         return res.status(503).json({ 
-          error: "Embedding service unavailable",
+          error: "Embedding service unavailable. Please check if the embedding server is running.",
           is_sufficient: false,
           similarity_score: 0
         });
       }
+      
       return res.status(500).json({ 
-        error: "Failed to generate embedding",
+        error: "Failed to generate embedding: " + embedError.message,
         is_sufficient: false,
         similarity_score: 0
       });
     }
 
-    // Fetch and score
-    const allChunks = await WebsiteData.findAll();
+    // ✅ Fetch chunks with error handling
+    let allChunks;
+    try {
+      console.log(`📊 Fetching database chunks...`);
+      allChunks = await WebsiteData.findAll();
+      console.log(`   Found ${allChunks.length} chunks`);
+    } catch (dbError) {
+      console.error("❌ Database error fetching chunks:", dbError);
+      activeRequests.delete(scrapingKey);
+      return res.status(500).json({ 
+        error: "Database error",
+        is_sufficient: false,
+        similarity_score: 0
+      });
+    }
     
     if (allChunks.length === 0) {
+      console.log("⚠️  No chunks in database");
       activeRequests.delete(scrapingKey);
       return res.status(404).json({ 
         error: "No documents in database",
@@ -217,10 +248,24 @@ export const handleQuery = async (req, res) => {
       });
     }
 
-    const scoredChunks = allChunks.map(row => ({
-      row,
-      score: cosineSimilarity(queryEmbedding, row.embedding)
-    }));
+    // ✅ Score chunks with validation
+    const scoredChunks = allChunks
+      .filter(row => row.embedding && Array.isArray(row.embedding))
+      .map(row => ({
+        row,
+        score: cosineSimilarity(queryEmbedding, row.embedding)
+      }))
+      .filter(item => !isNaN(item.score)); // Remove invalid scores
+
+    if (scoredChunks.length === 0) {
+      console.log("⚠️  No valid embeddings found");
+      activeRequests.delete(scrapingKey);
+      return res.status(500).json({ 
+        error: "No valid embeddings in database",
+        is_sufficient: false,
+        similarity_score: 0
+      });
+    }
 
     const topChunks = scoredChunks
       .sort((a, b) => b.score - a.score)
@@ -239,17 +284,11 @@ export const handleQuery = async (req, res) => {
         session_id: session_id,
       };
       
-      // If scraping is done and we have answer, include it
-      if (!scrapingInProgress.has(scrapingKey) && maxScore >= SIMILARITY_THRESHOLD) {
-        console.log(`✅ Scraping done, similarity sufficient - answering via poll`);
-        // We'll let the next non-check_similarity_only call handle the answer
-      }
-      
       activeRequests.delete(scrapingKey);
       return res.json(response);
     }
 
-    // Low similarity - scrape
+    // ✅ Low similarity - scrape
     if (maxScore < SIMILARITY_THRESHOLD && !skip_scraping) {
       
       if (scrapingInProgress.has(scrapingKey)) {
@@ -268,21 +307,26 @@ export const handleQuery = async (req, res) => {
         });
       }
 
-      console.log(`❌ Low similarity → Starting scraper`);
+      console.log(`❌ Low similarity (${(maxScore * 100).toFixed(2)}%) → Starting scraper`);
 
       scrapingInProgress.set(scrapingKey, Date.now());
 
-      await ChatSession.create({
-        session_id,
-        role: "user",
-        message: query,
-      });
+      // ✅ Save messages with error handling
+      try {
+        await ChatSession.create({
+          session_id,
+          role: "user",
+          message: query,
+        });
 
-      await ChatSession.create({
-        session_id,
-        role: "assistant",
-        message: "🔍 Searching the web for information...",
-      });
+        await ChatSession.create({
+          session_id,
+          role: "assistant",
+          message: "🔍 Searching the web for information...",
+        });
+      } catch (dbError) {
+        console.error("⚠️  Could not save messages:", dbError);
+      }
 
       triggerScraperWithCallback(query, session_id, scrapingKey);
 
@@ -298,7 +342,7 @@ export const handleQuery = async (req, res) => {
       });
     }
 
-    // Prepare context
+    // ✅ Prepare context
     const relevantChunks = topChunks.map(c => c.row);
     const websiteLinks = [...new Set(relevantChunks.map(c => c.website_link))];
     
@@ -338,7 +382,7 @@ CRITICAL INSTRUCTIONS:
 - If user asks for "the link" or "the website", provide the link from YOUR LAST RESPONSE
 - Example: You said "NGTSOL is a company...", user asks "give me the link" → find NGTSOL link in sources
 - ALWAYS look at BOTH conversation AND database context
-- Extract entity names from conversation (NGTSOL, VLC, etc.) and find their links in sources
+- Extract entity names from conversation and find their links in sources
 - Be direct and helpful
 - NO phrases like "According to the context"`;
     } else {
@@ -363,29 +407,45 @@ INSTRUCTIONS:
       { role: "user", content: query },
     ];
 
-    // Store user query
+    // ✅ Store user query with error handling
     if (!skip_scraping) {
-      await ChatSession.create({
-        session_id,
-        role: "user",
-        message: query,
-      });
+      try {
+        await ChatSession.create({
+          session_id,
+          role: "user",
+          message: query,
+        });
+      } catch (dbError) {
+        console.error("⚠️  Could not save user message:", dbError);
+      }
     }
 
-    // Call Groq
+    // ✅ Call Groq with error handling
     console.log(`🤖 Calling LLM...`);
     
-    const completion = await groq.chat.completions.create({
-      messages: messages,
-      model: "llama-3.3-70b-versatile",
-      temperature: 0.7,
-      max_tokens: 700,
-      top_p: 0.9,
-    });
+    let answer;
+    try {
+      const completion = await groq.chat.completions.create({
+        messages: messages,
+        model: "llama-3.3-70b-versatile",
+        temperature: 0.7,
+        max_tokens: 700,
+        top_p: 0.9,
+      });
 
-    const answer = completion.choices[0]?.message?.content || "No response generated";
-    
-    console.log(`💬 Answer: "${answer.substring(0, 100)}..."`);
+      answer = completion.choices[0]?.message?.content || "No response generated";
+      console.log(`💬 Answer: "${answer.substring(0, 100)}..."`);
+      
+    } catch (llmError) {
+      console.error("❌ LLM error:", llmError);
+      activeRequests.delete(scrapingKey);
+      
+      return res.status(500).json({ 
+        error: "LLM service error: " + llmError.message,
+        is_sufficient: false,
+        similarity_score: maxScore
+      });
+    }
     
     // Check if RAG failed
     const noInfoPhrases = [
@@ -420,11 +480,15 @@ INSTRUCTIONS:
 
       scrapingInProgress.set(scrapingKey, Date.now());
 
-      await ChatSession.create({
-        session_id,
-        role: "assistant",
-        message: "🔍 Searching the web for information...",
-      });
+      try {
+        await ChatSession.create({
+          session_id,
+          role: "assistant",
+          message: "🔍 Searching the web for information...",
+        });
+      } catch (dbError) {
+        console.error("⚠️  Could not save message:", dbError);
+      }
 
       triggerScraperWithCallback(query, session_id, scrapingKey);
 
@@ -440,18 +504,22 @@ INSTRUCTIONS:
       });
     }
 
-    // Store response
-    await ChatSession.create({
-      session_id,
-      role: "assistant",
-      message: answer,
-    });
+    // ✅ Store response with error handling
+    try {
+      await ChatSession.create({
+        session_id,
+        role: "assistant",
+        message: answer,
+      });
+    } catch (dbError) {
+      console.error("⚠️  Could not save assistant message:", dbError);
+    }
 
     const elapsed = Date.now() - startTime;
     console.log(`✅ Complete in ${elapsed}ms`);
     console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
 
-    // ✅ FIXED: Added all flags for frontend
+    // ✅ Send response
     const response = {
       answer: answer,
       sources: topChunks.map((c, idx) => ({
@@ -464,7 +532,6 @@ INSTRUCTIONS:
       max_similarity: (maxScore * 100).toFixed(2) + "%",
       context_used: useContext,
       session_id: session_id,
-      // ✅ CRITICAL FLAGS FOR FRONTEND
       is_sufficient: true,
       similarity_score: maxScore,
       scraping_in_progress: false,
@@ -475,11 +542,14 @@ INSTRUCTIONS:
     activeRequests.delete(scrapingKey);
 
   } catch (err) {
-    console.error("❌ Error:", err.message);
-    const scrapingKey = `${req.body.session_id}:${req.body.query.toLowerCase().trim()}`;
+    console.error("❌ UNHANDLED ERROR in handleQuery:");
+    console.error(err);
+    
+    const scrapingKey = `${req.body?.session_id}:${req.body?.query?.toLowerCase().trim()}`;
     activeRequests.delete(scrapingKey);
+    
     res.status(500).json({ 
-      error: "Internal server error",
+      error: "Internal server error: " + err.message,
       is_sufficient: false,
       similarity_score: 0
     });
@@ -488,39 +558,62 @@ INSTRUCTIONS:
 
 async function triggerScraperWithCallback(query, session_id, scrapingKey) {
   try {
-    console.log(`🚀 Scraper starting...`);
+    console.log(`🚀 Triggering scraper at ${PYTHON_SCRAPER_URL}...`);
     
     const response = await axios.post(PYTHON_SCRAPER_URL, {
       query: query,
       session_id: session_id
-    }, { timeout: 120000 });
+    }, { 
+      timeout: 120000,
+      validateStatus: (status) => status < 600 // Don't throw on 4xx/5xx
+    });
 
-    console.log(`✅ Scraper done:`, response.data);
+    console.log(`✅ Scraper response (${response.status}):`, response.data);
+    
+    if (response.status !== 200) {
+      console.error(`⚠️  Scraper returned non-200 status: ${response.status}`);
+    }
     
     if (response.data.message === 'No new results found' || response.data.new_urls === 0) {
-      await ChatSession.create({
-        session_id,
-        role: "assistant",
-        message: "❌ I couldn't find relevant information. Please try rephrasing.",
-      });
+      try {
+        await ChatSession.create({
+          session_id,
+          role: "assistant",
+          message: "❌ I couldn't find relevant information. Please try rephrasing.",
+        });
+      } catch (dbError) {
+        console.error("⚠️  Could not save message:", dbError);
+      }
     } else {
-      await ChatSession.create({
-        session_id,
-        role: "assistant",
-        message: "✅ I've searched the web and found new information. Please ask your question again.",
-      });
+      try {
+        await ChatSession.create({
+          session_id,
+          role: "assistant",
+          message: "✅ I've searched the web and found new information. Please ask your question again.",
+        });
+      } catch (dbError) {
+        console.error("⚠️  Could not save message:", dbError);
+      }
     }
     
     scrapingInProgress.delete(scrapingKey);
     
   } catch (error) {
-    console.error(`❌ Scraper failed:`, error.message);
+    console.error(`❌ Scraper error:`, error.message);
+    if (error.response) {
+      console.error(`   Status: ${error.response.status}`);
+      console.error(`   Data:`, error.response.data);
+    }
     
-    await ChatSession.create({
-      session_id,
-      role: "assistant",
-      message: "❌ Web search encountered an error. Please try again.",
-    });
+    try {
+      await ChatSession.create({
+        session_id,
+        role: "assistant",
+        message: "❌ Web search encountered an error. Please try again.",
+      });
+    } catch (dbError) {
+      console.error("⚠️  Could not save error message:", dbError);
+    }
     
     scrapingInProgress.delete(scrapingKey);
   }
@@ -528,12 +621,25 @@ async function triggerScraperWithCallback(query, session_id, scrapingKey) {
 
 function cosineSimilarity(a, b) {
   if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+    console.error("⚠️  Invalid vectors for similarity:", { 
+      aType: typeof a, 
+      bType: typeof b,
+      aLen: a?.length,
+      bLen: b?.length
+    });
     return 0;
   }
+  
   const dot = a.reduce((sum, val, i) => sum + val * b[i], 0);
   const normA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));
   const normB = Math.sqrt(b.reduce((sum, val) => sum + val * val, 0));
-  return normA === 0 || normB === 0 ? 0 : dot / (normA * normB);
+  
+  if (normA === 0 || normB === 0) {
+    console.error("⚠️  Zero norm vector");
+    return 0;
+  }
+  
+  return dot / (normA * normB);
 }
 
 export const getChatHistory = async (req, res) => {
@@ -575,6 +681,7 @@ export const clearHistory = async (req, res) => {
     
     res.json({ message: "History cleared" });
   } catch (err) {
+    console.error("Error clearing history:", err);
     res.status(500).json({ error: "Failed to clear history" });
   }
 };
