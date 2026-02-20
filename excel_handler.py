@@ -84,6 +84,9 @@ class JSONHandler:
         text = re.sub(r'Top Sections: [^\n]+', '', text)
         text = re.sub(r'Page 1/10+', '', text)
         text = re.sub(r'Page 1/2+', '', text)
+        text = re.sub(r'\n', '', text)
+        text = re.sub(r'[^A-Za-z0-9.,;:!?\'"()\s-]', '', text)
+        text = re.sub(r'Page \d+/\d+', '', text, flags=re.IGNORECASE)
         # Split into lines and process
         lines = text.split('\n')
         processed_lines = []

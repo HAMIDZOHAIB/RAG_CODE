@@ -1,23 +1,36 @@
 """
-main.py — FIXED FastAPI scraper endpoint
-✅ Batch JSON writes (reduces lock contention)
-✅ Better error handling for embeddings
-✅ Retry logic for queryController
-✅ Proper cleanup on errors
+main.py — FastAPI scraper endpoint (FIXED)
+
+Bugs fixed in this version:
+  BUG 4: embed_thread.join() had no timeout — if embedding crashed silently,
+          the thread would hang forever and trigger_query_controller never ran.
+          Fix: join with 120s timeout, continue even if thread is still alive.
+
+  BUG 5: trigger_query_controller had no retries and poor error messages.
+          If Node.js was briefly busy or returned 5xx, it silently failed.
+          Fix: 3 attempts with exponential backoff, clear error messages that
+          tell you exactly what's wrong (wrong port, wrong path, timeout, etc.)
+
+CORRECT FLOW:
+──────────────────────────────────────────────────────────────────────
+1. scraper.process_query()  → returns list of scraped dicts
+2. We spin up our own embed_thread (run_embedding_queue via threading.Thread)
+3. Each result is saved to k.json → embed_single_entry() called one-by-one
+4. After embed_thread finishes (with timeout) → wait 1s → call queryController
+──────────────────────────────────────────────────────────────────────
 """
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI
 from pydantic import BaseModel
 from query_scraper import EnhancedQueryScraper
 from excel_handler import JSONHandler
-from generate_embeddings import run_embedding
+from generate_embeddings import embed_single_entry
 import os
+import json
 import httpx
 import asyncio
 import threading
-from typing import List, Dict
-import traceback
-import time
+import queue
 
 app = FastAPI(title="Web Scraper API")
 
@@ -29,68 +42,89 @@ class ScrapeRequest(BaseModel):
     session_id: str = None
 
 
-# ✅ Thread-safe batch collector
-class BatchCollector:
-    """Collects scraped data and writes in batches to reduce file I/O"""
-    def __init__(self, batch_size: int = 3):
-        self.batch_size = batch_size
-        self.batch = []
-        self.lock = threading.Lock()
-        self.saved_count = 0
-        self.failed_count = 0
-        
-    def add(self, data: Dict, json_handler: JSONHandler, output_file: str) -> bool:
-        """
-        Add data to batch. Writes when batch is full.
-        Returns True if data was processed successfully.
-        """
-        with self.lock:
-            self.batch.append(data)
-            
-            # Write batch when full
-            if len(self.batch) >= self.batch_size:
-                return self._flush_batch(json_handler, output_file)
-            
-            return True
-    
-    def _flush_batch(self, json_handler: JSONHandler, output_file: str) -> bool:
-        """Write current batch to file"""
-        if not self.batch:
-            return True
-            
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER: get the assigned id for a URL from k.json
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_entry_id(output_file: str, url: str):
+    try:
+        with open(output_file, "r", encoding="utf-8") as f:
+            data = f.read().strip()
+            if not data:
+                return None
+            entries = json.loads(data)
+        for entry in reversed(entries):
+            if entry.get("website_link", "").rstrip("/") == url.rstrip("/"):
+                return entry.get("id")
+    except Exception as e:
+        print(f"   ⚠️  Could not read id from k.json: {e}")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMBEDDING RUNNER — processes items one at a time from a Queue
+# ─────────────────────────────────────────────────────────────────────────────
+def run_embedding_queue(work_queue: queue.Queue,
+                        json_handler: JSONHandler,
+                        output_file: str,
+                        counter: dict):
+    """
+    Runs in a background thread.
+    Pulls scraped_data dicts from work_queue and:
+      1. Appends to k.json
+      2. Calls embed_single_entry()
+    Stops when it receives None (sentinel).
+    """
+    while True:
+        scraped_data = work_queue.get()
+        if scraped_data is None:          # sentinel → exit
+            work_queue.task_done()
+            break
+
+        url = scraped_data.get("website_link", "N/A")
+        print(f"\n{'─'*55}")
+        print(f"💾 [EmbedRunner] → {url[:50]}")
+
+        # ── Step 1: Save to k.json ─────────────────────────────────
+        website_id = None
         try:
-            print(f"\n💾 Writing batch of {len(self.batch)} items...")
-            
-            # Write all items at once
             if os.path.exists(output_file):
-                json_handler.append_to_json(output_file, self.batch)
+                json_handler.append_to_json(output_file, [scraped_data])
             else:
-                json_handler.export_to_json(self.batch, "k.json")
-            
-            self.saved_count += len(self.batch)
-            self.batch = []
-            
-            print(f"   ✅ Batch written successfully")
-            return True
-            
+                json_handler.export_to_json([scraped_data], "k.json")
+
+            website_id = _get_entry_id(output_file, url)
+            print(f"   ✅ Saved → website_id={website_id}")
         except Exception as e:
-            print(f"   ❌ Batch write failed: {e}")
-            traceback.print_exc()
-            self.failed_count += len(self.batch)
-            self.batch = []  # Clear failed batch
-            return False
-    
-    def flush(self, json_handler: JSONHandler, output_file: str) -> bool:
-        """Force write remaining items"""
-        with self.lock:
-            return self._flush_batch(json_handler, output_file)
+            print(f"   ❌ Save failed: {e}")
+            counter["failed"] += 1
+            work_queue.task_done()
+            continue
+
+        # ── Step 2: Embed this entry ───────────────────────────────
+        if website_id:
+            try:
+                n = embed_single_entry(scraped_data, website_id)
+                counter["chunks"] += n
+                counter["saved"]  += 1
+                print(f"   ✅ Embedded → {n} chunks (id={website_id})")
+            except Exception as e:
+                import traceback
+                print(f"   ❌ Embed failed: {e}")
+                traceback.print_exc()
+                counter["failed"] += 1
+        else:
+            print(f"   ⚠️  Could not determine website_id — skipping embed")
+            counter["failed"] += 1
+
+        print(f"{'─'*55}")
+        work_queue.task_done()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ENDPOINT
+# ─────────────────────────────────────────────────────────────────────────────
 @app.post("/scrape")
-async def scrape(request: ScrapeRequest, background_tasks: BackgroundTasks):
-    """
-    ✅ FIXED: Batch processing + better error handling
-    """
+async def scrape(request: ScrapeRequest):
     try:
         query = request.query.strip()
         if not query:
@@ -101,187 +135,224 @@ async def scrape(request: ScrapeRequest, background_tasks: BackgroundTasks):
         json_handler = JSONHandler()
         output_file  = os.path.join(json_handler.output_dir, "k.json")
 
-        # Load already-scraped URLs
         already_scraped = set()
         if os.path.exists(output_file):
-            try:
-                already_scraped = json_handler.read_scraped_urls(output_file)
-            except Exception as e:
-                print(f"⚠️  Warning: Could not read scraped URLs: {e}")
+            already_scraped = json_handler.read_scraped_urls(output_file)
 
-        # ✅ Batch collector (writes every 3 items instead of every 1)
-        batch_collector = BatchCollector(batch_size=3)
+        # ── Counters ───────────────────────────────────────────────
+        counter = {"saved": 0, "failed": 0, "chunks": 0}
 
-        # ✅ IMPROVED CALLBACK
-        def on_website_scraped(scraped_data: dict):
-            """
-            Batch-based callback:
-            - Collects data in batches of 3
-            - Writes batch when full
-            - Runs embedding after each batch write
-            """
-            url = scraped_data.get("website_link", "N/A")
-            thread_name = threading.current_thread().name
-
-            # Add to batch (will auto-write when batch_size reached)
-            success = batch_collector.add(scraped_data, json_handler, output_file)
-            
-            if not success:
-                print(f"   ⚠️  [{thread_name}] Failed to save {url[:50]}")
-                return
-
-        # ✅ Run scraper with optimized threading
+        # ── Scrape ────────────────────────────────────────────────
         scraper = EnhancedQueryScraper(
             scraping_depth="multipage",
             max_subpages_per_site=10,
             crawl_method="bfs",
-            max_workers=5  # Limit to 5 concurrent threads
+            max_workers=5
         )
 
-        results = scraper.process_query(
+        # ── Capture return value safely ────────────────────────────
+        raw_return = scraper.process_query(
             query=query,
-            max_websites=5,
+            max_websites=2,
             already_scraped=already_scraped,
-            on_website_scraped=on_website_scraped
         )
 
-        # ✅ Flush any remaining batch items
-        print(f"\n🔄 Flushing remaining batch items...")
-        batch_collector.flush(json_handler, output_file)
+        results = _normalize_results(raw_return)
 
-        # ✅ Run embedding ONCE after all scraping is done
-        if batch_collector.saved_count > 0:
-            print(f"\n🧠 Running embedding for {batch_collector.saved_count} new items...")
-            try:
-                run_embedding()
-                print(f"   ✅ Embedding complete")
-            except Exception as embed_err:
-                print(f"   ❌ Embedding failed: {embed_err}")
-                traceback.print_exc()
-
-        # Check results
         if not results:
             return {
-                "message"  : "No new results found",
-                "new_urls" : 0,
+                "message"   : "No new results found",
+                "new_urls"  : 0,
                 "session_id": session_id
             }
 
         successful = [
             r for r in results
-            if r.get("title") not in ("Error", "Error - Failed to scrape")
+            if isinstance(r, dict) and
+               r.get("title") not in ("Error", "Error - Failed to scrape") and
+               r.get("website_link")
         ]
 
         print(f"\n{'='*55}")
-        print(f"🏁 Scraping complete")
-        print(f"   Saved: {batch_collector.saved_count} | Failed: {batch_collector.failed_count}")
+        print(f"🏁 Scraping done — {len(successful)} usable sites out of {len(results)}")
         print(f"{'='*55}")
 
-        # ✅ Trigger queryController with retry logic
-        if batch_collector.saved_count > 0:
-            # Use background task to avoid blocking response
-            background_tasks.add_task(
-                trigger_query_controller_with_retry,
-                query,
-                session_id,
-                max_retries=3
-            )
+        if not successful:
+            return {
+                "message"   : "No new results found",
+                "new_urls"  : 0,
+                "session_id": session_id
+            }
+
+        # ── Start embedding in a background thread ─────────────────
+        work_queue   = queue.Queue()
+        embed_thread = threading.Thread(
+            target=run_embedding_queue,
+            args=(work_queue, json_handler, output_file, counter),
+            daemon=True,
+            name="EmbedRunner"
+        )
+        embed_thread.start()
+
+        # Push all successful results into the queue
+        for item in successful:
+            work_queue.put(item)
+        work_queue.put(None)   # sentinel — tells runner to stop after last item
+
+        # ── Wait for embedding + call queryController ───────────────
+        asyncio.create_task(
+            wait_for_embed_then_query(embed_thread, query, session_id, counter)
+        )
 
         return {
-            "message"            : "Scraping completed",
-            "new_urls"           : len(successful),
-            "total_urls"         : len(already_scraped) + len(successful),
-            "saved_successfully" : batch_collector.saved_count,
-            "failed"             : batch_collector.failed_count,
-            "embedding_generated": batch_collector.saved_count > 0,
-            "session_id"         : session_id
+            "message"    : "Scraping complete, embedding in progress",
+            "new_urls"   : len(successful),
+            "total_urls" : len(already_scraped) + len(successful),
+            "session_id" : session_id
         }
 
     except Exception as e:
-        print(f"\n❌ SCRAPE ENDPOINT ERROR:")
+        import traceback
         traceback.print_exc()
-        return {
-            "error": str(e),
-            "session_id": request.session_id
-        }
+        return {"error": str(e)}
 
 
-# ✅ IMPROVED: Retry logic for queryController
-async def trigger_query_controller_with_retry(
-    query: str, 
-    session_id: str, 
-    max_retries: int = 3
-):
+# ─────────────────────────────────────────────────────────────────────────────
+# NORMALIZE: handle whatever process_query() returns
+# ─────────────────────────────────────────────────────────────────────────────
+def _normalize_results(raw):
     """
-    Call Node.js queryController with retry logic.
-    Waits 2 seconds before first attempt to ensure embeddings are ready.
+    Accepts any of these return shapes from process_query():
+      - list of dicts                    → return as-is
+      - tuple of dicts                   → convert to list
+      - tuple of (list_of_dicts, thread) → return first element
+      - tuple of (list_of_dicts, X, Y…)  → return first element if it's a list
     """
-    # ✅ Wait for embeddings to be fully indexed
-    print(f"\n⏳ Waiting 2s for embeddings to be indexed...")
-    await asyncio.sleep(2)
-    
-    for attempt in range(max_retries):
+    if raw is None:
+        return []
+
+    if isinstance(raw, list):
+        if not raw or isinstance(raw[0], dict):
+            return raw
+        if isinstance(raw[0], list):
+            return raw[0]
+
+    if isinstance(raw, tuple):
+        first = raw[0] if raw else None
+
+        if isinstance(first, list) and (not first or isinstance(first[0], dict)):
+            print(f"ℹ️  process_query returned tuple — using first element (list of {len(first)} results)")
+            return first
+
+        if isinstance(first, dict):
+            print(f"ℹ️  process_query returned flat tuple of {len(raw)} dicts")
+            return list(raw)
+
+        if len(raw) >= 2 and isinstance(raw[1], list):
+            return raw[1]
+
+    print(f"⚠️  Unexpected return type from process_query(): {type(raw)} — attempting list()")
+    try:
+        return list(raw)
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WAIT FOR EMBED → CALL QUERY CONTROLLER
+# BUG FIX 4: Added 120s timeout on embed_thread.join() so a crashed embed
+# thread doesn't block forever and prevent trigger_query_controller from running.
+# ─────────────────────────────────────────────────────────────────────────────
+async def wait_for_embed_then_query(embed_thread: threading.Thread,
+                                     query: str,
+                                     session_id: str,
+                                     counter: dict):
+    loop = asyncio.get_event_loop()
+
+    # BUG FIX 4: join with timeout — if embed thread hangs/crashes, don't block forever
+    def join_with_timeout():
+        embed_thread.join(timeout=120)
+        if embed_thread.is_alive():
+            print("⚠️  [EmbedRunner] Thread did not finish within 120s — continuing anyway")
+
+    await loop.run_in_executor(None, join_with_timeout)
+
+    saved  = counter.get("saved", 0)
+    chunks = counter.get("chunks", 0)
+    failed = counter.get("failed", 0)
+    print(f"\n✅ Embedding complete — saved={saved}, chunks={chunks}, failed={failed}")
+
+    if saved > 0:
+        await asyncio.sleep(1)   # let DB finish committing
+        print(f"🔄 Calling queryController (skip_scraping=True)...")
+        await trigger_query_controller(query, session_id)
+    elif failed > 0 and saved == 0:
+        # Even if all embeds failed, still call queryController so it can respond to
+        # the session with "couldn't find info" instead of leaving frontend hanging
+        print(f"⚠️  All {failed} embeds failed — still notifying queryController")
+        await trigger_query_controller(query, session_id)
+    else:
+        print(f"⚠️  Nothing was embedded and no failures recorded — skipping queryController call")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRIGGER QUERY CONTROLLER
+# BUG FIX 5: Added retries with backoff + detailed error messages so you
+# know exactly whether Node is unreachable, returning errors, or timing out.
+#
+# IMPORTANT: NODE_API_URL must match your Express router mount path exactly.
+# Default: http://localhost:3000/api/query
+# If your route is mounted differently (e.g. /api/v1/query), set NODE_API_URL env var.
+# ─────────────────────────────────────────────────────────────────────────────
+async def trigger_query_controller(query: str, session_id: str, retries: int = 2):
+    for attempt in range(1, retries + 2):
         try:
-            print(f"\n🔄 Calling queryController (attempt {attempt + 1}/{max_retries})...")
-            
             async with httpx.AsyncClient() as client:
+                print(f"   🔄 POST {NODE_API_URL} (attempt {attempt}/{retries+1})")
                 response = await client.post(
                     NODE_API_URL,
                     json={
                         "session_id"   : session_id,
                         "query"        : query,
-                        "skip_scraping": True  # ✅ CRITICAL: prevents loop
+                        "skip_scraping": True
                     },
-                    timeout=30.0
+                    timeout=45.0  # increased from 30s — LLM generation can be slow
                 )
-                
                 if response.status_code == 200:
                     result = response.json()
-                    answer = result.get("answer", "No answer")
-                    print(f"✅ queryController success: {answer[:120]}")
-                    return  # Success!
-                    
-                else:
-                    print(f"⚠️  queryController returned {response.status_code}")
-                    print(f"   Response: {response.text[:200]}")
-                    
-                    # Retry on 500 errors
-                    if response.status_code == 500 and attempt < max_retries - 1:
-                        wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
-                        print(f"   Retrying in {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    else:
-                        print(f"   ❌ Not retrying (status {response.status_code})")
-                        return
+                    answer = result.get("answer", "")
+                    print(f"✅ queryController responded ({len(answer)} chars): {answer[:120]}")
+                    return  # success — stop retrying
+
+                print(f"⚠️  queryController HTTP {response.status_code}: {response.text[:300]}")
+
+                # 4xx = client error (wrong URL, bad payload) — no point retrying
+                if response.status_code < 500:
+                    print(f"   👉 4xx error — check NODE_API_URL path and request format")
+                    return
 
         except httpx.ConnectError:
-            print(f"❌ Cannot reach Node.js on {NODE_API_URL}")
-            if attempt < max_retries - 1:
-                print(f"   Retrying in 2s...")
-                await asyncio.sleep(2)
-            else:
-                print(f"   ❌ Giving up after {max_retries} attempts")
-            
+            print(f"❌ Cannot connect to Node.js at {NODE_API_URL} (attempt {attempt})")
+            print(f"   👉 Is Node.js running? Is the port correct?")
+            print(f"   👉 Current NODE_API_URL = '{NODE_API_URL}'")
+            print(f"   👉 Set NODE_API_URL env var if your server uses a different port/path")
+
+        except httpx.TimeoutException:
+            print(f"⏱️  Request to queryController timed out after 45s (attempt {attempt})")
+            print(f"   👉 LLM or DB may be overloaded")
+
         except Exception as e:
-            print(f"❌ queryController error: {e}")
-            traceback.print_exc()
-            
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                print(f"   Retrying in {wait_time}s...")
-                await asyncio.sleep(wait_time)
-            else:
-                print(f"   ❌ Giving up after {max_retries} attempts")
+            print(f"❌ Unexpected error calling queryController (attempt {attempt}): {e}")
 
+        # Wait before retrying (exponential backoff: 2s, 4s)
+        if attempt <= retries:
+            wait = 2 * attempt
+            print(f"   ⏳ Retrying in {wait}s...")
+            await asyncio.sleep(wait)
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "ok",
-        "service": "scraper-api"
-    }
+    print(f"❌ trigger_query_controller failed after {retries+1} attempts — frontend may be stuck")
+    print(f"   👉 User will see '✅ Found new information. Please ask your question again.'")
+    print(f"   👉 They can re-ask to get the answer from the freshly scraped data")
 
 
 if __name__ == "__main__":

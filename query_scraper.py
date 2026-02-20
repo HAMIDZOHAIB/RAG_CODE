@@ -1,10 +1,16 @@
 """
-Enhanced Query Scraper - OPTIMIZED THREADED VERSION
-✅ Limited thread pool (max 5 concurrent threads)
-✅ Batch processing for better control
-✅ Improved error handling
-✅ Connection pooling per thread
-✅ Better logging and progress tracking
+Enhanced Query Scraper — FIXED THREADED VERSION
+
+Every issue from logs resolved:
+
+✅ Fix 1: Stats reset at start of each process_query() call
+✅ Fix 2: BFS sleep reduced (0.5-1.2s → 0.2-0.5s for subpage crawl)
+✅ Fix 3: Callback does NOT run inside the executor worker
+          Worker: scrape → store result → signal done
+          Separate thread: wait for signal → save JSON → embed
+          → threads never block each other waiting for embedding
+✅ Fix 4: BFS queue capped at max_pages × 3 links (no 48-link explosion)
+✅ Fix 5: No sleep between DIFFERENT websites (only between subpages of same site)
 """
 
 import requests
@@ -18,16 +24,28 @@ import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fake_useragent import UserAgent
-import json
+import queue as Queue
 
 
 class EnhancedQueryScraper:
     """
-    OPTIMIZED THREADED SCRAPER
-    - Max 5 concurrent threads (prevents resource exhaustion)
-    - Batch processing with progress tracking
-    - Better error recovery
-    - Connection pooling
+    THREADED SCRAPER — TRUE per-thread pipeline
+    
+    Flow:
+      Thread 1: scrape site1 → put result in queue → DONE (fast)
+      Thread 2: scrape site2 → put result in queue → DONE (fast)
+      Thread 3: scrape site3 → put result in queue → DONE (fast)
+      
+      Callback runner (separate thread):
+        while queue not empty:
+          result = queue.get()
+          save JSON → run_embedding()   ← sequential, no races
+    
+    This means:
+    - Scraping threads are never blocked by save/embed
+    - Save+embed is sequential (no file lock races)
+    - Total time = max(scrape times) + sum(embed times)
+    - vs old: sum(scrape + embed times) per thread
     """
 
     def __init__(
@@ -39,43 +57,32 @@ class EnhancedQueryScraper:
         playwright_timeout: int = 30000,
         use_undetected: bool = True,
         headless: bool = True,
-        max_workers: int = 5  # ✅ NEW: Limit concurrent threads
+        max_workers: int = 5
     ):
         self.scraping_depth = scraping_depth
         self.max_subpages_per_site = (
             max_subpages_per_site if max_subpages_per_site is not None else float('inf')
         )
-        self.crawl_method = crawl_method
+        self.crawl_method   = crawl_method
         self.use_playwright = use_playwright
         self.playwright_timeout = playwright_timeout
         self.use_undetected = use_undetected
-        self.headless = headless
-        self.max_workers = max_workers  # ✅ NEW
+        self.headless       = headless
+        self.max_workers    = max_workers
 
-        self.ua = UserAgent()
-
-        # Main-thread session (for search only)
+        self.ua      = UserAgent()
         self.session = requests.Session()
         self._update_session_headers()
 
-        # Thread-local storage
+        # Thread-local: each worker gets its own requests.Session
         self._thread_local = threading.local()
 
-        # Locks
+        # Print lock (cosmetic only — keep logs readable)
         self._print_lock = threading.Lock()
-        self._stats_lock = threading.Lock()  # ✅ NEW: For thread-safe stats
 
-        # Stats tracking
-        self.stats = {
-            'successful': 0,
-            'failed': 0,
-            'total_chars': 0
-        }
-
-        # Chrome driver — main thread only, lazy init
+        # Chrome — main thread only
         self.driver = None
 
-        # URL scoring dictionaries (unchanged)
         self.priority_paths = {
             'pricing': 100, 'price': 100, 'plans': 100, 'plan': 100,
             'demo': 95, 'trial': 95, 'free-trial': 95, 'get-started': 95,
@@ -89,12 +96,10 @@ class EnhancedQueryScraper:
             'industries': 55, 'use-cases': 55, 'faq': 55, 'help': 55, 'support': 55,
             'contact': 50, 'contact-us': 50
         }
-
         self.acceptable_paths = {
             'blog': 30, 'news': 30, 'updates': 30,
             'careers': 20, 'jobs': 20
         }
-
         self.skip_paths = [
             '/signup', '/sign-up', '/signin', '/sign-in', '/login', '/register',
             '/admin', '/dashboard', '/profile', '/account', '/settings', '/user',
@@ -103,7 +108,6 @@ class EnhancedQueryScraper:
             '/download', '/downloads', '/assets', '/cdn',
             'forget-password', '/reset-password',
         ]
-
         self.skip_extensions = [
             '.pdf', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.ico', '.bmp',
             '.mp4', '.mp3', '.avi', '.mov', '.wmv', '.flv', '.webm',
@@ -113,69 +117,56 @@ class EnhancedQueryScraper:
             '.xml', '.json', '.csv', '.rss', '.atom'
         ]
 
-        print(f"\n🎯 OPTIMIZED Scraping Configuration:")
-        print(f"   📊 Depth        : {scraping_depth.upper()}")
-        print(f"   🔢 Max Pages    : {'UNLIMITED' if self.max_subpages_per_site == float('inf') else max_subpages_per_site}")
-        print(f"   🔄 Method       : {crawl_method.upper()}")
-        print(f"   🧵 Max Workers  : {max_workers}")
-        print(f"   👻 Headless     : {headless}")
+        print(f"\n🎯 Scraper Configuration:")
+        print(f"   📊 Depth      : {scraping_depth.upper()}")
+        print(f"   🔢 Max Pages  : {'∞' if self.max_subpages_per_site == float('inf') else max_subpages_per_site}")
+        print(f"   🔄 Method     : {crawl_method.upper()}")
+        print(f"   🧵 Workers    : {max_workers}")
 
     # ─────────────────────────────────────────────────────────────────
     # SESSION HELPERS
     # ─────────────────────────────────────────────────────────────────
 
     def _update_session_headers(self):
-        """Update headers for main session"""
         self.session.headers.update({
             'User-Agent': self.ua.random,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
             'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
+            'DNT': '1', 'Connection': 'keep-alive', 'Upgrade-Insecure-Requests': '1',
         })
 
     def _get_thread_session(self) -> requests.Session:
-        """
-        Returns a thread-local requests.Session with connection pooling.
-        ✅ Reuses connections within the same thread for better performance
-        """
+        """One session per thread with connection pooling. Never shared."""
         if not hasattr(self._thread_local, 'session'):
             s = requests.Session()
-            # ✅ Configure connection pooling
             adapter = requests.adapters.HTTPAdapter(
-                pool_connections=10,
-                pool_maxsize=10,
-                max_retries=3
+                pool_connections=5,
+                pool_maxsize=5,
+                max_retries=2
             )
             s.mount('http://', adapter)
             s.mount('https://', adapter)
-            
             s.headers.update({
                 'User-Agent': self.ua.random,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5',
                 'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
+                'DNT': '1', 'Connection': 'keep-alive', 'Upgrade-Insecure-Requests': '1',
             })
             self._thread_local.session = s
         return self._thread_local.session
 
     # ─────────────────────────────────────────────────────────────────
-    # CHROME — main thread only (for search)
+    # CHROME — main thread only
     # ─────────────────────────────────────────────────────────────────
 
     def _init_driver(self):
-        """Chrome driver for main thread search ONLY"""
         if self.driver is not None:
             return self.driver
         try:
             import undetected_chromedriver as uc
-
-            print("   🚀 Initializing Chrome for search...")
+            print("   🚀 Initializing Chrome...")
             options = uc.ChromeOptions()
             if self.headless:
                 options.add_argument('--headless=new')
@@ -184,17 +175,15 @@ class EnhancedQueryScraper:
             options.add_argument('--no-sandbox')
             options.add_argument('--disable-notifications')
             options.add_argument(f'--window-size={random.randint(1024,1920)},{random.randint(768,1080)}')
-
             self.driver = uc.Chrome(options=options, use_subprocess=True)
             print("   ✅ Chrome ready")
             return self.driver
         except Exception as e:
-            print(f"   ⚠️ Chrome init failed (will use requests fallback): {e}")
+            print(f"   ⚠️ Chrome failed: {e}")
             self.use_undetected = False
             return None
 
     def _close_driver(self):
-        """Safely close Chrome driver"""
         if self.driver:
             try:
                 self.driver.quit()
@@ -203,17 +192,12 @@ class EnhancedQueryScraper:
                 pass
 
     # ─────────────────────────────────────────────────────────────────
-    # CONTENT FETCHING
+    # FETCH — thread-safe, no Chrome in workers
     # ─────────────────────────────────────────────────────────────────
 
     def _fetch_content(self, url: str, retries: int = 2) -> Tuple[Optional[str], Optional[BeautifulSoup]]:
-        """
-        Thread-safe content fetch with retry logic
-        ✅ Uses thread-local session with connection pooling
-        ✅ Automatic retries on failure
-        """
+        """Uses thread-local session. NO Chrome. Retries with backoff."""
         session = self._get_thread_session()
-        
         for attempt in range(retries + 1):
             try:
                 response = session.get(url, timeout=20)
@@ -222,30 +206,29 @@ class EnhancedQueryScraper:
                 return response.text, soup
             except requests.exceptions.RequestException as e:
                 if attempt < retries:
-                    time.sleep(1 * (attempt + 1))  # Exponential backoff
+                    time.sleep(0.5 * (attempt + 1))
                     continue
-                else:
-                    with self._print_lock:
-                        print(f"      ⚠️ Fetch failed after {retries + 1} attempts [{url[:50]}]: {e}")
-                    return None, None
+                with self._print_lock:
+                    print(f"      ⚠️ Fetch failed after {retries+1} attempts [{url[:50]}]: {e}")
+                return None, None
             except Exception as e:
                 with self._print_lock:
-                    print(f"      ⚠️ Unexpected error [{url[:50]}]: {e}")
+                    print(f"      ⚠️ Error [{url[:50]}]: {e}")
                 return None, None
 
     # ─────────────────────────────────────────────────────────────────
-    # SEARCH (unchanged but included for completeness)
+    # SEARCH
     # ─────────────────────────────────────────────────────────────────
 
     def search_duckduckgo(self, query: str, max_results: int = 5) -> List[str]:
         print(f"\n🔍 Searching: '{query}'")
         urls = self._try_ddgs_search(query, max_results)
         if urls:
-            print(f"   ✅ Found {len(urls)} URLs (ddgs)")
+            print(f"   ✅ Found {len(urls)} URLs")
             return urls
         urls = self._try_alternative_search(query, max_results)
         if urls:
-            print(f"   ✅ Found {len(urls)} URLs (alternative)")
+            print(f"   ✅ Found {len(urls)} URLs (fallback)")
             return urls
         print("   ❌ No URLs found")
         return []
@@ -273,13 +256,11 @@ class EnhancedQueryScraper:
                 continue
             except Exception as e:
                 print(f"   ⚠️ {pkg} error: {e}")
-                continue
-        print("   ⚠️ Neither ddgs nor duckduckgo_search installed")
         return []
 
     def _try_alternative_search(self, query: str, max_results: int) -> List[str]:
         try:
-            print("   🔄 Trying Google fallback...")
+            print("   🔄 Google fallback...")
             encoded = quote_plus(query)
             url = f"https://www.google.com/search?q={encoded}&num={max_results}"
             resp = requests.get(url, headers={'User-Agent': self.ua.random}, timeout=15)
@@ -297,7 +278,7 @@ class EnhancedQueryScraper:
                             break
             return urls
         except Exception as e:
-            print(f"   ⚠️ Google fallback failed: {e}")
+            print(f"   ⚠️ Fallback failed: {e}")
             return []
 
     def _decode_duckduckgo_url(self, url: str) -> Optional[str]:
@@ -332,24 +313,19 @@ class EnhancedQueryScraper:
             'telegram.org', 'slack.com', 'zoom.us', 'teams.microsoft.com'
         ]
         url_lower = url.lower()
-        if any(d in url_lower for d in skip_domains):
-            return False
-        if any(p in url_lower for p in self.skip_paths):
-            return False
-        if any(url_lower.endswith(e) for e in self.skip_extensions):
-            return False
+        if any(d in url_lower for d in skip_domains): return False
+        if any(p in url_lower for p in self.skip_paths): return False
+        if any(url_lower.endswith(e) for e in self.skip_extensions): return False
         return True
 
     # ─────────────────────────────────────────────────────────────────
-    # URL HELPERS (unchanged - keeping for completeness)
+    # URL HELPERS
     # ─────────────────────────────────────────────────────────────────
 
     def normalize_url(self, url: str) -> str:
         url = url.strip().lower()
-        if '#' in url:
-            url = url.split('#')[0]
-        if url.endswith('/'):
-            url = url[:-1]
+        if '#' in url: url = url.split('#')[0]
+        if url.endswith('/'): url = url[:-1]
         url = url.replace('://www.', '://')
         if '?' in url:
             base = url.split('?')[0]
@@ -358,113 +334,104 @@ class EnhancedQueryScraper:
         return url
 
     def score_url_importance(self, url: str, link_text: str = "") -> Tuple[int, List[str]]:
-        url_lower = url.lower()
-        text_lower = link_text.lower()
+        url_lower, text_lower = url.lower(), link_text.lower()
         score, matched = 0, []
         for kw, pts in self.priority_paths.items():
             if kw in url_lower or kw in text_lower:
-                score += pts
-                matched.append(kw)
+                score += pts; matched.append(kw)
         for kw, pts in self.acceptable_paths.items():
             if kw in url_lower or kw in text_lower:
-                score += pts
-                matched.append(kw)
-        for pat in ['blog/20', 'news/20', 'article/', '/tag/', '/category/',
-                    'author/', 'archive/', 'wp-content', '/feed', '/rss']:
-            if pat in url_lower:
-                score -= 50
-        if urlparse(url).path in ('', '/'):
-            score += 10
+                score += pts; matched.append(kw)
+        for pat in ['blog/20','news/20','article/','/tag/','/category/',
+                    'author/','archive/','wp-content','/feed','/rss']:
+            if pat in url_lower: score -= 50
+        if urlparse(url).path in ('', '/'): score += 10
         return max(0, score), matched
 
-    def extract_and_prioritize_links(self, url: str, soup: BeautifulSoup) -> List[Dict]:
+    def extract_and_prioritize_links(self, url: str, soup: BeautifulSoup,
+                                     limit: int = 20) -> List[Dict]:
+        """
+        ✅ Fix 4: Cap returned links at `limit` (default 20).
+        Old code returned ALL 48 links from aspiedent.com even when
+        max_pages=3 — wasted time scoring/queueing unused links.
+        """
         base_domain = urlparse(url).netloc
         links, seen = [], set()
         for a in soup.find_all('a', href=True):
             abs_url = urljoin(url, a['href'])
-            if urlparse(abs_url).netloc != base_domain:
-                continue
-            if not self._is_valid_internal_link(abs_url):
-                continue
+            if urlparse(abs_url).netloc != base_domain: continue
+            if not self._is_valid_internal_link(abs_url): continue
             norm = self.normalize_url(abs_url)
-            if norm in seen:
-                continue
+            if norm in seen: continue
             seen.add(norm)
             score, kws = self.score_url_importance(abs_url, a.get_text(strip=True))
             if score > 0:
                 links.append({'url': abs_url, 'score': score, 'keywords': kws})
+            if len(links) >= limit * 2:   # collect 2× then sort and take top `limit`
+                break
         links.sort(key=lambda x: x['score'], reverse=True)
-        return links
+        return links[:limit]
 
     def _is_valid_internal_link(self, url: str) -> bool:
         url_lower = url.lower()
-        if any(p in url_lower for p in self.skip_paths):
-            return False
-        if any(url_lower.endswith(e) for e in self.skip_extensions):
-            return False
-        if re.search(r'/\d{4}/\d{2}/', url_lower):
-            return False
-        if re.search(r'[?&]page=\d+', url_lower):
-            return False
+        if any(p in url_lower for p in self.skip_paths): return False
+        if any(url_lower.endswith(e) for e in self.skip_extensions): return False
+        if re.search(r'/\d{4}/\d{2}/', url_lower): return False
+        if re.search(r'[?&]page=\d+', url_lower): return False
         return True
 
     def filter_already_scraped(self, urls: List[str], scraped_urls: Set[str]) -> List[str]:
         normed = {self.normalize_url(u) for u in scraped_urls}
         new_urls, skipped = [], 0
         for u in urls:
-            if self.normalize_url(u) in normed:
-                skipped += 1
-            else:
-                new_urls.append(u)
+            if self.normalize_url(u) in normed: skipped += 1
+            else: new_urls.append(u)
         if skipped:
             print(f"   🔄 Skipped {skipped} already-scraped URLs")
         return new_urls
 
     # ─────────────────────────────────────────────────────────────────
-    # TEXT EXTRACTION (unchanged)
+    # TEXT EXTRACTION
     # ─────────────────────────────────────────────────────────────────
 
     def extract_readable_text(self, soup: BeautifulSoup, remove_nav: bool = True) -> str:
-        remove_tags = (['script', 'style', 'nav', 'footer', 'header', 'iframe', 'svg', 'noscript']
-                       if remove_nav else ['script', 'style', 'iframe', 'svg', 'noscript'])
+        remove_tags = (['script','style','nav','footer','header','iframe','svg','noscript']
+                       if remove_nav else ['script','style','iframe','svg','noscript'])
         for tag in soup(remove_tags):
             tag.decompose()
         main = None
-        for sel in ['main', 'article', '[role="main"]', '.main-content',
-                    '#main-content', '.content', '#content']:
+        for sel in ['main','article','[role="main"]','.main-content',
+                    '#main-content','.content','#content']:
             main = soup.select_one(sel)
-            if main:
-                break
+            if main: break
         if not main:
             main = soup.find('body') or soup
         return self._create_text_chunks(self._extract_content_sections(main))
 
     def _extract_content_sections(self, element) -> List[Dict]:
-        sections, current_header = [], None
+        sections = []
         for child in element.find_all(
-            ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'ol'], recursive=True
+            ['h1','h2','h3','h4','h5','h6','p','ul','ol'], recursive=True
         ):
             tag = child.name.lower()
-            if tag in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+            if tag in ('h1','h2','h3','h4','h5','h6'):
                 txt = child.get_text(strip=True)
                 if txt and len(txt) > 2:
-                    current_header = txt
-                    sections.append({'type': 'header', 'content': txt})
+                    sections.append({'type':'header','content':txt})
             elif tag == 'p':
                 txt = child.get_text(separator=' ', strip=True)
                 if txt and len(txt) > 20:
-                    sections.append({'type': 'paragraph', 'content': txt})
-            elif tag in ('ul', 'ol'):
+                    sections.append({'type':'paragraph','content':txt})
+            elif tag in ('ul','ol'):
                 items = [li.get_text(strip=True)
                          for li in child.find_all('li', recursive=False)
                          if li.get_text(strip=True)]
                 if items:
-                    sections.append({'type': 'list', 'content': items})
+                    sections.append({'type':'list','content':items})
         return sections
 
     def _create_text_chunks(self, sections: List[Dict]) -> str:
-        if not sections:
-            return "No content extracted"
+        if not sections: return "No content extracted"
         chunks, cur, cur_wc, num = [], [], 0, 1
         MAX = 500
         for s in sections:
@@ -474,20 +441,18 @@ class EnhancedQueryScraper:
             elif t == 'list':
                 fmt = '\n'.join(f"• {i}" for i in s['content']) + '\n'
                 wc  = sum(len(i.split()) for i in s['content'])
-            else:
-                continue
+            else: continue
             if cur_wc > 0 and cur_wc + wc > MAX:
                 chunks.append(f"\n--- Section {num} ---\n\n" + ''.join(cur))
-                cur, cur_wc, num = [fmt], wc, num + 1
+                cur, cur_wc, num = [fmt], wc, num+1
             else:
-                cur.append(fmt)
-                cur_wc += wc
+                cur.append(fmt); cur_wc += wc
         if cur:
             chunks.append(f"\n--- Section {num} ---\n\n" + ''.join(cur))
         return '\n'.join(chunks)
 
     # ─────────────────────────────────────────────────────────────────
-    # CRAWLERS (unchanged - keeping BFS as example)
+    # CRAWLERS — sleep reduced (Fix 2), link cap added (Fix 4)
     # ─────────────────────────────────────────────────────────────────
 
     def crawl_website_bfs(self, start_url: str, max_pages: int) -> List[Dict]:
@@ -496,27 +461,26 @@ class EnhancedQueryScraper:
         queue     = deque([start_url])
         pages     = []
         while queue:
-            if not unlimited and len(pages) >= max_pages:
-                break
+            if not unlimited and len(pages) >= max_pages: break
             url = queue.popleft()
             try:
                 content, soup = self._fetch_content(url)
-                if not content or not soup:
-                    continue
-                title = (soup.title.string.strip()
-                         if soup.title and soup.title.string else "")
+                if not content or not soup: continue
+                title = soup.title.string.strip() if soup.title and soup.title.string else ""
                 text  = self.extract_readable_text(soup)
                 score, kws = self.score_url_importance(url)
-                pages.append({'url': url, 'title': title,
-                               'text': text, 'score': score, 'keywords': kws})
+                pages.append({'url':url,'title':title,'text':text,'score':score,'keywords':kws})
                 with self._print_lock:
                     print(f"         ✅ [{len(pages)}] {url[:55]} ({len(text):,} ch)")
-                for lk in self.extract_and_prioritize_links(url, soup):
+                # ✅ Fix 4: cap links at max_pages×3 so we don't queue 48 links for a 3-page crawl
+                remaining = (max_pages - len(pages)) if not unlimited else 20
+                link_limit = max(remaining * 3, 5)
+                for lk in self.extract_and_prioritize_links(url, soup, limit=link_limit):
                     norm = self.normalize_url(lk['url'])
                     if norm not in visited:
-                        visited.add(norm)
-                        queue.append(lk['url'])
-                time.sleep(random.uniform(0.5, 1.2))
+                        visited.add(norm); queue.append(lk['url'])
+                # ✅ Fix 2: shorter sleep between subpages of same site
+                time.sleep(random.uniform(0.2, 0.5))
             except Exception as e:
                 with self._print_lock:
                     print(f"         ❌ {url[:50]}: {e}")
@@ -528,29 +492,24 @@ class EnhancedQueryScraper:
         if visited is None: visited = set()
         if pages   is None: pages   = []
         unlimited = max_pages == float('inf')
-        if (not unlimited and len(pages) >= max_pages) or depth > max_depth:
-            return pages
+        if (not unlimited and len(pages) >= max_pages) or depth > max_depth: return pages
         norm = self.normalize_url(start_url)
-        if norm in visited:
-            return pages
+        if norm in visited: return pages
         visited.add(norm)
         try:
             content, soup = self._fetch_content(start_url)
-            if not content or not soup:
-                return pages
+            if not content or not soup: return pages
             title = soup.title.string.strip() if soup.title and soup.title.string else ""
             text  = self.extract_readable_text(soup)
             score, kws = self.score_url_importance(start_url)
-            pages.append({'url': start_url, 'title': title,
-                          'text': text, 'score': score, 'keywords': kws})
+            pages.append({'url':start_url,'title':title,'text':text,'score':score,'keywords':kws})
             with self._print_lock:
                 print(f"         ✅ D{depth} [{len(pages)}] {start_url[:55]} ({len(text):,} ch)")
-            for lk in self.extract_and_prioritize_links(start_url, soup):
-                if not unlimited and len(pages) >= max_pages:
-                    break
-                self.crawl_website_dfs(lk['url'], max_pages, visited, pages,
-                                       depth + 1, max_depth)
-                time.sleep(random.uniform(0.5, 1.2))
+            remaining = (max_pages - len(pages)) if not unlimited else 20
+            for lk in self.extract_and_prioritize_links(start_url, soup, limit=remaining*3):
+                if not unlimited and len(pages) >= max_pages: break
+                self.crawl_website_dfs(lk['url'], max_pages, visited, pages, depth+1, max_depth)
+                time.sleep(random.uniform(0.2, 0.5))  # ✅ Fix 2
         except Exception as e:
             with self._print_lock:
                 print(f"         ❌ {start_url[:50]}: {e}")
@@ -562,47 +521,39 @@ class EnhancedQueryScraper:
         pq, pages = [], []
         try:
             content, soup = self._fetch_content(start_url)
-            if not content or not soup:
-                return pages
+            if not content or not soup: return pages
             title = soup.title.string.strip() if soup.title and soup.title.string else ""
             text  = self.extract_readable_text(soup)
             score, kws = self.score_url_importance(start_url)
-            pages.append({'url': start_url, 'title': title,
-                          'text': text, 'score': score, 'keywords': kws})
+            pages.append({'url':start_url,'title':title,'text':text,'score':score,'keywords':kws})
             with self._print_lock:
                 print(f"         🏠 {start_url[:55]} ({len(text):,} ch)")
-            for lk in self.extract_and_prioritize_links(start_url, soup):
+            for lk in self.extract_and_prioritize_links(start_url, soup, limit=20):
                 norm = self.normalize_url(lk['url'])
                 if norm not in visited:
-                    pq.append((lk['score'], lk['url'], lk['keywords']))
-                    visited.add(norm)
+                    pq.append((lk['score'], lk['url'], lk['keywords'])); visited.add(norm)
         except Exception as e:
             with self._print_lock:
                 print(f"         ❌ {start_url[:50]}: {e}")
             return pages
-
         pq.sort(key=lambda x: x[0], reverse=True)
         while pq:
-            if not unlimited and len(pages) >= max_pages:
-                break
+            if not unlimited and len(pages) >= max_pages: break
             sc, url, kws = pq.pop(0)
             try:
                 content, soup = self._fetch_content(url)
-                if not content or not soup:
-                    continue
+                if not content or not soup: continue
                 title = soup.title.string.strip() if soup.title and soup.title.string else ""
                 text  = self.extract_readable_text(soup)
-                pages.append({'url': url, 'title': title,
-                              'text': text, 'score': sc, 'keywords': kws})
+                pages.append({'url':url,'title':title,'text':text,'score':sc,'keywords':kws})
                 with self._print_lock:
                     print(f"         🎯 [{len(pages)}] {url[:55]} ({len(text):,} ch)")
-                for lk in self.extract_and_prioritize_links(url, soup):
+                for lk in self.extract_and_prioritize_links(url, soup, limit=20):
                     norm = self.normalize_url(lk['url'])
                     if norm not in visited:
-                        pq.append((lk['score'], lk['url'], lk['keywords']))
-                        visited.add(norm)
+                        pq.append((lk['score'], lk['url'], lk['keywords'])); visited.add(norm)
                 pq.sort(key=lambda x: x[0], reverse=True)
-                time.sleep(random.uniform(0.5, 1.2))
+                time.sleep(random.uniform(0.2, 0.5))  # ✅ Fix 2
             except Exception as e:
                 with self._print_lock:
                     print(f"         ❌ {url[:50]}: {e}")
@@ -617,129 +568,90 @@ class EnhancedQueryScraper:
             print(f"   📄 [BASIC] {url[:65]}")
         try:
             content, soup = self._fetch_content(url)
-            if not content or not soup:
-                raise Exception("Failed to fetch")
+            if not content or not soup: raise Exception("Failed to fetch")
             title = soup.title.string.strip() if soup.title and soup.title.string else ""
             meta_parts = []
-            for attr in [('name', 'description'), ('property', 'og:description')]:
-                tag = soup.find('meta', attrs={attr[0]: attr[1]})
+            for attr in [('name','description'),('property','og:description')]:
+                tag = soup.find('meta', attrs={attr[0]:attr[1]})
                 if tag and tag.get('content'):
                     c = tag['content'].strip()
-                    if c not in meta_parts:
-                        meta_parts.append(c)
+                    if c not in meta_parts: meta_parts.append(c)
             text = self.extract_readable_text(soup)
             with self._print_lock:
-                print(f"      ✅ {len(text):,} chars — {title[:40]}")
-            return {
-                'website_link': url,
-                'title':        title or 'No title found',
-                'metadata':     ' | '.join(meta_parts) or 'No metadata found',
-                'plain_text':   text or 'No content extracted'
-            }
+                print(f"      ✅ {len(text):,} chars")
+            return {'website_link':url,'title':title or 'No title',
+                    'metadata':' | '.join(meta_parts) or 'No metadata','plain_text':text}
         except Exception as e:
             with self._print_lock:
                 print(f"      ❌ {url[:50]}: {e}")
-            return {
-                'website_link': url, 'title': 'Error - Failed to scrape',
-                'metadata': f'Error: {e}', 'plain_text': f'Failed: {e}'
-            }
+            return {'website_link':url,'title':'Error - Failed to scrape',
+                    'metadata':f'Error: {e}','plain_text':f'Failed: {e}'}
 
     def scrape_website_deep(self, url: str) -> Dict:
         with self._print_lock:
             print(f"   📄 [DEEP] {url[:65]}")
         try:
             content, soup = self._fetch_content(url)
-            if not content or not soup:
-                raise Exception("Failed to fetch")
+            if not content or not soup: raise Exception("Failed to fetch")
             title = soup.title.string.strip() if soup.title and soup.title.string else ""
             meta_parts = []
             for meta in soup.find_all('meta'):
-                n = meta.get('name', '').lower()
-                p = meta.get('property', '').lower()
-                c = meta.get('content', '').strip()
-                if c and (n in ('description', 'keywords', 'author') or
-                          p in ('og:description', 'og:title')):
-                    if c not in meta_parts:
-                        meta_parts.append(c)
+                n = meta.get('name','').lower(); p = meta.get('property','').lower()
+                c = meta.get('content','').strip()
+                if c and (n in ('description','keywords','author') or
+                          p in ('og:description','og:title')):
+                    if c not in meta_parts: meta_parts.append(c)
             text = self.extract_readable_text(soup, remove_nav=False)
             with self._print_lock:
-                print(f"      ✅ {len(text):,} chars — {title[:40]}")
-            return {
-                'website_link': url, 'title': title,
-                'metadata': ' | '.join(meta_parts), 'plain_text': text
-            }
+                print(f"      ✅ {len(text):,} chars")
+            return {'website_link':url,'title':title,'metadata':' | '.join(meta_parts),'plain_text':text}
         except Exception as e:
             with self._print_lock:
                 print(f"      ❌ {url[:50]}: {e}")
-            return {
-                'website_link': url, 'title': 'Error',
-                'metadata': 'Failed to scrape', 'plain_text': f'Error: {e}'
-            }
+            return {'website_link':url,'title':'Error','metadata':'Failed','plain_text':f'Error: {e}'}
 
     def scrape_website_multipage(self, url: str, max_subpages: int = None) -> Dict:
         if max_subpages is None:
             max_subpages = self.max_subpages_per_site
         with self._print_lock:
             print(f"   📄 [MULTI-{self.crawl_method.upper()}] {url[:60]}")
-
-        if   self.crawl_method == "bfs":      pages = self.crawl_website_bfs(url, max_subpages)
-        elif self.crawl_method == "dfs":      pages = self.crawl_website_dfs(url, max_subpages)
-        else:                                  pages = self.crawl_website_priority(url, max_subpages)
-
+        if   self.crawl_method == "bfs":  pages = self.crawl_website_bfs(url, max_subpages)
+        elif self.crawl_method == "dfs":  pages = self.crawl_website_dfs(url, max_subpages)
+        else:                              pages = self.crawl_website_priority(url, max_subpages)
         if not pages:
-            return {
-                'website_link': url, 'title': 'Error',
-                'metadata': 'Failed to crawl', 'plain_text': 'No pages could be crawled'
-            }
-
-        all_kws = [kw for p in pages for kw in p.get('keywords', [])]
+            return {'website_link':url,'title':'Error','metadata':'Failed','plain_text':'No pages crawled'}
+        all_kws = [kw for p in pages for kw in p.get('keywords',[])]
         top_kws = sorted(set(all_kws), key=all_kws.count, reverse=True)[:5]
-        meta    = f"Crawled {len(pages)} pages | Sections: {', '.join(top_kws)}"
-
+        meta = f"Crawled {len(pages)} pages | Sections: {', '.join(top_kws)}"
         body = f"Website: {url}\nPages: {len(pages)}\n"
         for i, p in enumerate(pages, 1):
-            body += (f"\n--- Page {i}: {p.get('title', '')} ---\n"
-                     f"URL: {p['url']}\n{p['text']}\n")
-
+            body += f"\n--- Page {i}: {p.get('title','')} ---\nURL: {p['url']}\n{p['text']}\n"
         with self._print_lock:
             print(f"      ✅ {len(body):,} chars from {len(pages)} pages")
-
-        return {
-            'website_link': url,
-            'title':        pages[0]['title'],
-            'metadata':     meta,
-            'plain_text':   body
-        }
+        return {'website_link':url,'title':pages[0]['title'],'metadata':meta,'plain_text':body}
 
     def scrape_website(self, url: str) -> Dict:
         url = self._validate_and_fix_url(url)
         if not url:
-            return {
-                'website_link': url, 'title': 'Error',
-                'metadata': 'Invalid URL', 'plain_text': 'URL validation failed'
-            }
+            return {'website_link':url,'title':'Error','metadata':'Invalid URL','plain_text':'URL validation failed'}
         if   self.scraping_depth == "basic":     return self.scrape_website_basic(url)
         elif self.scraping_depth == "deep":      return self.scrape_website_deep(url)
         elif self.scraping_depth == "multipage": return self.scrape_website_multipage(url)
         else:                                    return self.scrape_website_basic(url)
 
     def _validate_and_fix_url(self, url: str) -> Optional[str]:
-        if not url or not isinstance(url, str):
-            return None
+        if not url or not isinstance(url, str): return None
         url = url.strip()
-        if url.startswith('//'):
-            url = 'https:' + url
-        elif not url.startswith('http'):
-            url = 'https://' + url
+        if url.startswith('//'): url = 'https:' + url
+        elif not url.startswith('http'): url = 'https://' + url
         url = self._decode_duckduckgo_url(url)
         try:
             p = urlparse(url)
             return url if p.scheme and p.netloc else None
-        except:
-            return None
+        except: return None
 
     # ─────────────────────────────────────────────────────────────────
-    # ✅ OPTIMIZED process_query — LIMITED THREAD POOL
+    # ✅ FIXED process_query
     # ─────────────────────────────────────────────────────────────────
 
     def process_query(
@@ -750,20 +662,42 @@ class EnhancedQueryScraper:
         on_website_scraped: Callable[[Dict], None] = None
     ) -> List[Dict]:
         """
-        ✅ OPTIMIZED: Uses max 5 concurrent threads regardless of URL count
-        ✅ Better progress tracking and error handling
+        TRUE per-thread pipeline using a callback queue.
+
+        Architecture:
+        ┌─────────────────────────────────────────────────────────┐
+        │  ThreadPoolExecutor (max_workers threads)               │
+        │  Thread 1: scrape site1 → put(result) → DONE ✅        │
+        │  Thread 2: scrape site2 → put(result) → DONE ✅        │
+        │  Thread 3: scrape site3 → put(result) → DONE ✅        │
+        └──────────────────────┬──────────────────────────────────┘
+                               │  Queue (thread-safe)
+        ┌──────────────────────▼──────────────────────────────────┐
+        │  Callback runner (ONE dedicated thread)                 │
+        │  while results available:                               │
+        │    result = queue.get()                                 │
+        │    on_website_scraped(result)  ← save JSON + embed     │
+        └─────────────────────────────────────────────────────────┘
+
+        WHY this is better than your current approach:
+        - Scraping threads are NEVER blocked by slow embedding
+        - on_website_scraped runs sequentially → no file lock races
+        - No jitter/sleep hacks needed
+        - Stats reset on every call (Fix 1)
         """
         print(f"\n{'='*65}")
-        print(f"🚀 OPTIMIZED QUERY SCRAPER")
+        print(f"🚀 QUERY SCRAPER")
         print(f"{'='*65}")
-        print(f"Query       : '{query}'")
-        print(f"Depth       : {self.scraping_depth.upper()}")
-        print(f"Max Workers : {self.max_workers}")
+        print(f"Query          : '{query}'")
+        print(f"Depth          : {self.scraping_depth.upper()}")
+        print(f"Max Workers    : {self.max_workers}")
+        print(f"Already scraped: {len(already_scraped or set())} URLs")
+
+        # ✅ Fix 1: Reset stats on every call
+        stats = {'successful': 0, 'failed': 0, 'total_chars': 0}
 
         if already_scraped is None:
             already_scraped = set()
-
-        print(f"Already scraped: {len(already_scraped)} URLs")
 
         # Search
         urls = self.search_duckduckgo(query, max_results=max_websites * 3)
@@ -771,114 +705,118 @@ class EnhancedQueryScraper:
             print("\n❌ No URLs found!")
             return []
 
-        # Filter
+        # Filter already-scraped
         if already_scraped:
             print(f"\n🔍 Filtering already-scraped URLs...")
             urls = self.filter_already_scraped(urls, already_scraped)
 
         urls = urls[:max_websites]
-
         if not urls:
-            print("\n⚠️  All found URLs were already scraped!")
+            print("\n⚠️  All URLs already scraped!")
             return []
 
-        # Thread pool
-        num_threads = min(len(urls), self.max_workers)  # ✅ Cap at max_workers
-        print(f"\n🧵 Using {num_threads} workers for {len(urls)} URLs")
-        print(f"{'='*65}")
+        num_threads = min(len(urls), self.max_workers)
+        print(f"\n🧵 {num_threads} workers for {len(urls)} URLs")
+        print(f"{'='*65}\n")
 
-        results = []
+        results      = []
         results_lock = threading.Lock()
 
+        # ── ✅ Fix 3: Callback queue — scraping threads just put results here ──
+        # The callback runner thread picks them up and processes one at a time
+        # → no blocking of scraping threads during slow embedding
+        callback_queue = Queue.Queue()
+
+        def callback_runner():
+            """
+            Dedicated thread that processes scraped results one at a time.
+            Runs on_website_scraped (save JSON + embed) sequentially.
+            Ends when it receives the sentinel value None.
+            """
+            while True:
+                item = callback_queue.get()
+                if item is None:        # sentinel — no more items
+                    callback_queue.task_done()
+                    break
+                data, idx, total = item
+                url = data.get('website_link','?')
+                print(f"\n💾 [Callback] Processing [{idx}/{total}]: {url[:50]}")
+                try:
+                    on_website_scraped(data)
+                    print(f"   ✅ [Callback] Done [{idx}/{total}]")
+                except Exception as e:
+                    print(f"   ❌ [Callback] Error: {e}")
+                callback_queue.task_done()
+
+        # Start callback runner thread (only if there's a callback)
+        if on_website_scraped:
+            cb_thread = threading.Thread(target=callback_runner, daemon=True, name="CallbackRunner")
+            cb_thread.start()
+
         def scrape_one(url: str, index: int) -> Dict:
-            """Worker function with better error handling"""
-            thread_name = threading.current_thread().name
-            
+            """
+            Worker: ONLY scrapes. Does NOT call on_website_scraped directly.
+            Puts successful result into callback_queue and exits immediately.
+            """
+            t = threading.current_thread().name
             with self._print_lock:
-                print(f"\n🧵 [{thread_name}] ▶ START [{index}/{len(urls)}]: {url[:50]}")
+                print(f"🧵 [{t}] ▶ START [{index}/{len(urls)}]: {url[:55]}")
 
             try:
-                data = self.scrape_website(url)
-                is_ok = data.get('title') not in ('Error', 'Error - Failed to scrape')
-                
-                # Update stats
-                with self._stats_lock:
-                    if is_ok:
-                        self.stats['successful'] += 1
-                        self.stats['total_chars'] += len(data.get('plain_text', ''))
-                    else:
-                        self.stats['failed'] += 1
-
-                # Store result
-                with results_lock:
-                    results.append(data)
-                    done_count = len(results)
-
-                with self._print_lock:
-                    status = "✅" if is_ok else "❌"
-                    print(f"🧵 [{thread_name}] {status} DONE [{done_count}/{len(urls)}]")
-
-                # Callback
-                if is_ok and on_website_scraped:
-                    try:
-                        with self._print_lock:
-                            print(f"🧵 [{thread_name}] 💾 Saving & embedding...")
-                        on_website_scraped(data)
-                        with self._print_lock:
-                            print(f"🧵 [{thread_name}] ✅ Saved")
-                    except Exception as cb_err:
-                        with self._print_lock:
-                            print(f"🧵 [{thread_name}] ⚠️  Callback error: {cb_err}")
-                        # Don't fail the whole operation on callback error
-                        pass
-
-                return data
-
+                data  = self.scrape_website(url)
+                is_ok = data.get('title') not in ('Error','Error - Failed to scrape')
             except Exception as e:
-                with self._print_lock:
-                    print(f"🧵 [{thread_name}] ❌ Exception: {e}")
-                
-                # Return error data
-                error_data = {
-                    'website_link': url,
-                    'title': 'Error - Exception',
-                    'metadata': f'Thread exception: {e}',
-                    'plain_text': f'Failed: {e}'
-                }
-                
-                with results_lock:
-                    results.append(error_data)
-                
-                with self._stats_lock:
-                    self.stats['failed'] += 1
-                
-                return error_data
+                data  = {'website_link':url,'title':'Error','metadata':f'Exception: {e}','plain_text':f'Error: {e}'}
+                is_ok = False
 
-        # ✅ Run with limited thread pool
+            with results_lock:
+                results.append(data)
+                done = len(results)
+
+            if is_ok:
+                stats['successful'] += 1
+                stats['total_chars'] += len(data.get('plain_text',''))
+            else:
+                stats['failed'] += 1
+
+            status = "✅" if is_ok else "❌"
+            with self._print_lock:
+                print(f"🧵 [{t}] {status} DONE [{done}/{len(urls)}]: {url[:50]}")
+
+            # ✅ Fix 3: Put in queue — don't block this thread
+            if is_ok and on_website_scraped:
+                callback_queue.put((data, done, len(urls)))
+
+            return data
+
+        # ── Run all scraping threads ─────────────────────────────────
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = {
                 executor.submit(scrape_one, url, idx): url
                 for idx, url in enumerate(urls, 1)
             }
-            
-            # Wait for all to complete
             for future in as_completed(futures):
                 try:
                     future.result()
                 except Exception as e:
-                    print(f"❌ Future exception: {e}")
+                    print(f"❌ Future error: {e}")
 
-        # Summary
+        # ── Signal callback runner that scraping is done ─────────────
+        if on_website_scraped:
+            callback_queue.put(None)   # sentinel
+            cb_thread.join()           # wait for all callbacks to finish
+
+        # ── Summary ─────────────────────────────────────────────────
         self._close_driver()
 
         print(f"\n{'='*65}")
-        print(f"✅ ALL THREADS FINISHED")
-        print(f"   ✅ Successful : {self.stats['successful']}")
-        print(f"   ❌ Failed     : {self.stats['failed']}")
-        if self.stats['successful'] > 0:
-            avg_chars = self.stats['total_chars'] // self.stats['successful']
-            print(f"   📝 Total text : {self.stats['total_chars']:,} chars")
-            print(f"   📊 Avg/site   : {avg_chars:,} chars")
+        print(f"✅ ALL DONE")
+        print(f"   ✅ Successful : {stats['successful']}")
+        print(f"   ❌ Failed     : {stats['failed']}")
+        if stats['successful']:
+            avg = stats['total_chars'] // stats['successful']
+            print(f"   📝 Total text : {stats['total_chars']:,} chars")
+            print(f"   📊 Avg/site   : {avg:,} chars")
         print(f"{'='*65}")
 
         return results
