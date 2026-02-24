@@ -4,7 +4,7 @@ from sentence_transformers import SentenceTransformer
 
 app = FastAPI()
 
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+model = SentenceTransformer("mixedbread-ai/mxbai-embed-large-v1")
 
 class EmbedRequest(BaseModel):
     text: str
@@ -17,5 +17,5 @@ def embed_text(req: EmbedRequest):
     """
     Receives a user query and returns its embedding.
     """
-    embedding = model.encode(req.text).tolist()  # 768-dimension float array
+    embedding = model.encode(req.text).tolist()  
     return {"embedding": embedding}

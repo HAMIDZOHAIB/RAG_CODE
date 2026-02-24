@@ -1,0 +1,125 @@
+{
+  "total": 8,
+  "mcqs": [
+    {
+      "id": 1,
+      "session_id": "session-1771871305828-gxyifi60k",
+      "query": "give me some situation judgement Question and thier assessment on behavioural assessment technique or test like in this way if user chose a then its traits is this so write in this way",
+      "question": "** You are working on a team project and one of your team members is not pulling their weight. What do you do?",
+      "options": {
+        "A": "Confront the team member and tell them they need to step up their game.",
+        "B": "Try to compensate for the team member's lack of effort by doing more work yourself.",
+        "C": "Talk to the team member and try to understand what's going on and see if there's a way to help them get back on track.",
+        "D": "Go to the team leader and report the team member's lack of effort."
+      },
+      "answer": null,
+      "assessment": "If you chose the first option, you tend to be assertive and direct, but may also come across as confrontational or aggressive, whereas choosing the second option reveals that you tend to be a team player and willing to help out, but may also be a people-pleaser and take on too much work, and opting for the third option indicates that you tend to be empathetic and willing to listen, and are likely to be a good team player and problem-solver, but selecting the last option suggests that you tend to be avoidant and may not be willing to take responsibility for addressing the issue directly. This behavior can significantly impact your relationships with your team members and the overall success of the project. Your approach to handling a difficult team member can say a lot about your personality and behavior. It can also influence how others perceive you and interact with you in the team.",
+      "saved_at": "2026-02-24T20:44:13.967Z"
+    },
+    {
+      "id": 2,
+      "session_id": "session-1771871305828-gxyifi60k",
+      "query": "give me some situation judgement Question and thier assessment on behavioural assessment technique or test like in this way if user chose a then its traits is this so write in this way",
+      "question": "** You are given a new project with a tight deadline. What do you do?",
+      "options": {
+        "A": "Start working on the project right away and try to get as much done as possible.",
+        "B": "Take some time to plan and prioritize the project before starting to work on it.",
+        "C": "Ask for an extension on the deadline because you don't think you can get it done on time.",
+        "D": "Delegate the project to someone else because you don't think you have the skills or expertise."
+      },
+      "answer": null,
+      "assessment": "If you chose the first option, you tend to be impulsive and action-oriented, but may also be prone to mistakes and burnout, which can be both beneficial and detrimental to your work, whereas choosing the second option reveals that you tend to be organized and strategic, and are likely to approach the project in a thoughtful and methodical way, allowing you to manage your time effectively and produce high-quality results. This behavior can be an indicator of your ability to work under pressure and manage your workload. Your approach to handling a new project with a tight deadline can reveal a lot about your work style and personality. It can also impact your productivity and overall job satisfaction.",
+      "saved_at": "2026-02-24T20:44:13.967Z"
+    },
+    {
+      "id": 3,
+      "session_id": "session-1771871305828-gxyifi60k",
+      "query": "give me at least 10 MCQS on situation judgement Question and thier assessment on behavioural assessment technique or test like in this way if user chose a then its traits is this so write in this way",
+      "question": "You are working on a team project and one of your team members is not pulling their weight. What do you do?",
+      "options": {
+        "A": "Confront the team member and tell them they need to step up their game",
+        "B": "Talk to the team member and try to understand the reason behind their lack of contribution",
+        "C": "Ignore the issue and focus on your own work",
+        "D": "Go to the team leader and complain about the team member"
+      },
+      "answer": "B",
+      "assessment": "Choosing this option reveals that you have good communication and interpersonal skills, and are able to approach conflicts in a constructive manner, which makes you a team player who values collaboration, you are likely to be able to work effectively with others to achieve a common goal, and your ability to manage conflicts will help to build trust and respect within the team, ultimately leading to better outcomes.",
+      "saved_at": "2026-02-24T20:59:44.389Z"
+    },
+    {
+      "id": 4,
+      "session_id": "session-1771871305828-gxyifi60k",
+      "query": "give me at least 10 MCQS on situation judgement Question and thier assessment on behavioural assessment technique or test like in this way if user chose a then its traits is this so write in this way",
+      "question": "You are given a task with a tight deadline, but you realize that the task is not feasible to complete within the given time frame. What do you do?",
+      "options": {
+        "A": "Try to complete the task as quickly as possible, even if it means sacrificing quality",
+        "B": "Negotiate with your manager to extend the deadline",
+        "C": "Prioritize the task and focus on completing the most important aspects",
+        "D": "Delegate the task to someone else"
+      },
+      "answer": "B",
+      "assessment": "Selecting this option indicates that you are able to prioritize tasks and manage your time effectively, which is a key aspect of being a productive and efficient worker, you are also able to communicate effectively with your manager and are willing to negotiate to find a solution that works for everyone, demonstrating your ability to work collaboratively and find mutually beneficial solutions.",
+      "saved_at": "2026-02-24T20:59:44.389Z"
+    },
+    {
+      "id": 5,
+      "session_id": "session-1771871305828-gxyifi60k",
+      "query": "give me at least 10 MCQS on situation judgement Question and thier assessment on behavioural assessment technique or test like in this way if user chose a then its traits is this so write in this way",
+      "question": "You are working on a project and you realize that you have made a mistake that could have serious consequences. What do you do?",
+      "options": {
+        "A": "Try to cover up the mistake and hope no one notices",
+        "B": "Own up to the mistake and apologize to your team and manager",
+        "C": "Blame someone else for the mistake",
+        "D": "Try to fix the mistake on your own without"
+      },
+      "answer": null,
+      "assessment": null,
+      "saved_at": "2026-02-24T20:59:44.389Z"
+    },
+    {
+      "id": 6,
+      "session_id": "session-1771871305828-gxyifi60k",
+      "query": "give me at least 10 unique  MCQS on situation judgement Question and thier assessment on behavioural assessment technique or test like in this way if user chose a then its traits is this so write in this way",
+      "question": "You are working on a team project and one of your team members is not pulling their weight. What do you do?",
+      "options": {
+        "A": "Confront the team member and tell them to step up their game",
+        "B": "Try to compensate for the team member's lack of effort by doing more work yourself",
+        "C": "Talk to the team member and try to understand the reasons behind their lack of effort",
+        "D": "Report the team member to the supervisor"
+      },
+      "answer": null,
+      "assessment": "This person's behavior reveals that they are likely to be aggressive and confrontational when dealing with team members who are not pulling their weight, as they may lash out or become overly critical, or on the other hand, they may be overly responsible and self-sacrificing, taking on too much of the workload themselves, or they could be empathetic and communicative, trying to understand the team member's struggles and offering help, or possibly avoidant and unassertive, neglecting to address the issue altogether, each approach showcasing a distinct aspect of their personality and behavior in a team setting.",
+      "saved_at": "2026-02-24T21:01:16.531Z"
+    },
+    {
+      "id": 7,
+      "session_id": "session-1771871305828-gxyifi60k",
+      "query": "give me at least 10 unique  MCQS on situation judgement Question and thier assessment on behavioural assessment technique or test like in this way if user chose a then its traits is this so write in this way",
+      "question": "You are given a new task at work that you have never done before. What do you do?",
+      "options": {
+        "A": "Jump right in and try to figure it out as you go",
+        "B": "Ask for guidance and support from your supervisor or colleagues",
+        "C": "Take some time to research and learn about the task before starting",
+        "D": "Avoid the task and try to delegate it to someone else"
+      },
+      "answer": null,
+      "assessment": "The way this person approaches a new task at work reveals their underlying personality traits, such as being impulsive and reckless, diving headfirst into the task without proper planning or consideration, or collaborative and open to feedback, seeking guidance and support from colleagues, or proactive and self-directed, taking the initiative to learn and adapt, or avoidant and lacking initiative, hesitating to take on the new challenge, each response highlighting a unique facet of their behavior and work style.",
+      "saved_at": "2026-02-24T21:01:16.531Z"
+    },
+    {
+      "id": 8,
+      "session_id": "session-1771871305828-gxyifi60k",
+      "query": "give me at least 10 unique  MCQS on situation judgement Question and thier assessment on behavioural assessment technique or test like in this way if user chose a then its traits is this so write in this way",
+      "question": "You are working on a project and you realize that you made a mistake that could have serious consequences. What do you do?",
+      "options": {
+        "A": "Try to cover up the mistake and hope no one notices",
+        "B": "Own up to the mistake and apologize to the team and supervisor",
+        "C": "Blame someone else for the mistake",
+        "D": "Try to fix the mistake without telling anyone"
+      },
+      "answer": null,
+      "assessment": "When faced with a mistake that could impact the project, this person's reaction reveals their character, as they may be dishonest and unaccountable, trying to shift the blame or cover up the error, or responsible and accountable, owning up to the mistake and taking steps to rectify it, or deflective and uncooperative, becoming defensive and unwilling to collaborate, or secretive and uncommunicative, hiding the mistake and failing to inform others, each response exposing a distinct aspect of their personality and behavior under pressure.",
+      "saved_at": "2026-02-24T21:01:16.531Z"
+    }
+  ]
+}
