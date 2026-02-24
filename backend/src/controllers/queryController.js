@@ -3,6 +3,12 @@ import axios from "axios";
 import Groq from "groq-sdk";
 import WebsiteData from "../../models/websitedata.js";
 import ChatSession from "../../models/ChatSession.js";
+import { saveMcqsToFile } from "../controllers/Mcqhandler.js";
+import { exportMcqsToExcel } from "../controllers/exportMcqsToExcel.js";
+import fs from "fs";
+
+import path  from "path";
+import { fileURLToPath } from "url";
 
 const TOP_K = 5;
 const SIMILARITY_THRESHOLD = 0.35;
@@ -410,6 +416,8 @@ RULES:
 4. Use conversation history ONLY to resolve what the user means — not to invent facts
 5. If user asks for links, list them from AVAILABLE LINKS section
 6. Answer in 2-4 sentences`;
+
+
   }
 
   // ── ENTITY SWITCH ──────────────────────────────────────────────────────────
@@ -461,10 +469,15 @@ async function saveMessage(session_id, role, message) {
 // 8. MAIN HANDLER
 // FIX: User message saved only ONCE per request, answer always returned to frontend
 // ─────────────────────────────────────────────────────────────────────────────
+// ─── ADD THIS IMPORT at the top of your controller ───────────────────────────
+// const { saveMcqsToFile } = require("./mcqHandler");
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ← ONLY NEW IMPORT ADDED
+
 export const handleQuery = async (req, res) => {
   const startTime = Date.now();
 
-  // FIX: Track whether user message has been saved this request
   let userMessageSaved = false;
 
   const saveUserMessage = async (session_id, query) => {
@@ -511,7 +524,6 @@ export const handleQuery = async (req, res) => {
       return res.status(500).json({ error: "Database error", is_sufficient: false, similarity_score: 0 });
     }
 
-    // FIX: Filter out system/status messages so they don't pollute LLM context
     const conversationHistory = sessionMessages
       .map(m => ({ role: m.role, content: m.message }))
       .filter(m => !m.content.includes('🔍') && !m.content.includes('⏳') &&
@@ -530,11 +542,6 @@ export const handleQuery = async (req, res) => {
     if (intent === 'link_request' && !skip_scraping) {
       const historyLinks = extractLinksFromHistory(conversationHistory);
 
-      // FIX: Only use sessionCache links if the cached topic is related to
-      // what the user is currently asking about (resolve via last user message).
-      // This prevents "give me the link" after a topic switch from returning
-      // links from a completely different previous topic (e.g. Ibn al-Nafis
-      // links appearing for water cycle or machine learning questions).
       const lastUserTopic = conversationHistory
         .filter(m => m.role === 'user')
         .slice(-3)
@@ -544,8 +551,6 @@ export const handleQuery = async (req, res) => {
 
       const cachedTopic = (sessionCache?.lastTopic || '').toLowerCase();
 
-      // Only trust cached links if the cached topic words appear in recent queries
-      // OR if the cache is very recent (within last 2 messages = same topic thread)
       const recentMsgCount = conversationHistory.length;
       const cacheIsRecent  = sessionCache &&
         (recentMsgCount <= 4 || lastUserTopic.includes(cachedTopic.split(' ')[0]));
@@ -586,7 +591,6 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
           console.error("⚠️ LLM error for link request:", e.message);
         }
 
-        // FIX: Guaranteed fallback so frontend always gets a displayable answer
         if (!linkAnswer) {
           linkAnswer = `Here are the links from our previous conversation:\n\n` +
             allLinks.map((l, i) => `${i+1}. ${l}`).join('\n');
@@ -636,10 +640,6 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
       return res.status(500).json({ error: "DB error", is_sufficient: false, similarity_score: 0 });
     }
 
-    // ── Empty DB: trigger scraper immediately instead of returning 404 ────────
-    // When DB is empty (fresh migration / new model), we must scrape first.
-    // Previously this returned 404 and stopped — now it kicks off scraping
-    // exactly like any other "no info" situation.
     if (allChunks.length === 0) {
       if (scrapingInProgress.has(scrapingKey)) {
         const elapsed = ((Date.now() - scrapingInProgress.get(scrapingKey)) / 1000).toFixed(0);
@@ -666,8 +666,6 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
       });
     }
 
-    // FIX: pgvector returns embedding as a string "[0.1, 0.2, ...]" not a JS array.
-    // Parse it back to a float array before cosine similarity comparison.
     const parseEmbedding = (val) => {
       if (Array.isArray(val)) return val;
       if (typeof val === 'string') {
@@ -701,7 +699,7 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
       return res.json({
         max_similarity: (maxScore * 100).toFixed(2) + "%",
         similarity_score: maxScore,
-        is_sufficient: maxScore >= SIMILARITY_THRESHOLD_RELAXED, // use relaxed for check_similarity_only
+        is_sufficient: maxScore >= SIMILARITY_THRESHOLD_RELAXED,
         scraping_in_progress: scrapingInProgress.has(scrapingKey),
         session_id
       });
@@ -710,21 +708,12 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
     // ── Scrape decision ────────────────────────────────────────────────────
     const userWantsScrape = intent === 'scrape_intent';
 
-    // Use relaxed threshold for follow_up/clarification — their queries often
-    // score lower against webpage chunks even when the answer IS in the DB.
     const effectiveThreshold = (intent === 'follow_up' || intent === 'clarification')
       ? SIMILARITY_THRESHOLD_RELAXED
       : SIMILARITY_THRESHOLD;
 
     console.log(`📐 Threshold: ${effectiveThreshold} (intent=${intent}), score=${maxScore.toFixed(3)}`);
 
-    // KEY RULE: Only scrape BEFORE the LLM if:
-    //   1. User explicitly requested a scrape, OR
-    //   2. Score is so low there is truly nothing relevant in DB
-    //      AND it's not a link/follow-up/clarification intent
-    // Removed: (!entityMatch) condition — entity check was too aggressive and
-    // caused scraping even when the LLM could answer (e.g. "capital of sweden").
-    // Entity mismatch is now only used AFTER the LLM fails to answer.
     const skipScrapingAtThreshold = ['link_request', 'follow_up', 'clarification'].includes(intent);
 
     const needsScrape = !skipScrapingAtThreshold && (
@@ -772,14 +761,12 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
     });
 
     // ── Build LLM messages ─────────────────────────────────────────────────
-    // FIX: Pass full conversation history so LLM knows prior messages
     const messages = [
       { role: "system", content: systemPrompt },
       ...conversationHistory.slice(-10),
       { role: "user",   content: query },
     ];
 
-    // FIX: Save user message ONCE before calling LLM
     if (!skip_scraping) {
       await saveUserMessage(session_id, query);
     }
@@ -791,7 +778,7 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
         messages,
         model: "llama-3.3-70b-versatile",
         temperature: 0.4,
-        max_tokens: 700,
+        max_tokens: 400,
         top_p: 0.9
       });
       answer = completion.choices[0]?.message?.content;
@@ -802,11 +789,197 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
                                     is_sufficient: false, similarity_score: maxScore });
     }
 
-    // FIX: Guaranteed fallback — frontend will ALWAYS receive a non-empty answer
     if (!answer || answer.trim() === '') {
       answer = "I wasn't able to generate a response. Please try rephrasing your question.";
       console.warn("⚠️ LLM returned empty answer, using fallback");
     }
+
+    // ── MCQ DETECTION & SAVE ───────────────────────────────────────────────
+    // Detects if the LLM answer looks like MCQs and silently appends to Mcqs.json.
+    // Does NOT change `answer` — it displays on screen exactly as before.
+    // Does NOT affect any other logic below.
+  // ── MCQ DETECTION & SAVE ───────────────────────────────────────────────────
+// ── MCQ DETECTION & SAVE ───────────────────────────────────────────────────
+// FIXES:
+//   1. Parser now extracts the Assessment block per question
+//   2. Second LLM call rewrites assessment as a plain paragraph
+//   3. saveMcqsToFile() now receives { question, options, answer, assessment }
+// ──────────────────────────────────────────────────────────────────────────
+try {
+  const isMcqAnswer =
+    /Q\d+[\.\):]|Question\s*\d+[\.\):]|\d+[\.\)]\s+.{10,}/i.test(answer) &&
+    /\b[A-D][\.\)]\s+/i.test(answer);
+
+  console.log("🧩 isMcqAnswer:", isMcqAnswer);
+
+  if (isMcqAnswer) {
+
+    // ── STEP 1: Split into per-question blocks ─────────────────────────────
+    const blocks = answer
+      .split(/(?=\*{0,2}(?:Q\d+[\.\):\s]|Question\s*\d+[\.\):\s]|\d+[\.\)]\s))/im)
+      .map(b => b.trim())
+      .filter(Boolean);
+
+    // ── STEP 2: Parse each block ───────────────────────────────────────────
+    const parsed = blocks.map(block => {
+      const lines = block.split("\n").map(l => l.trim()).filter(Boolean);
+
+      // ── Question text (first line, strip numbering + markdown) ────────────
+      const question = lines[0]
+        .replace(/^\*{1,2}/, "")
+        .replace(/\*{1,2}$/, "")
+        .replace(/^(Q\d+[\.\):\s]+|Question\s*\d+[\.\):\s]+|\d+[\.\)]\s+)/i, "")
+        .trim();
+
+      const options = { A: null, B: null, C: null, D: null };
+      let correct     = null;
+      let rawAssessment = "";         // ← NEW: collect raw assessment text
+      let inAssessment  = false;      // ← NEW: flag when we're inside Assessment block
+
+      lines.slice(1).forEach(line => {
+        // ── Detect Assessment heading ──────────────────────────────────────
+        if (/^\*{0,2}Assessment\*{0,2}\s*:?/i.test(line)) {
+          inAssessment = true;
+          // capture anything after "Assessment:" on the same line
+          const inline = line.replace(/^\*{0,2}Assessment\*{0,2}\s*:?\s*/i, "").trim();
+          if (inline) rawAssessment += " " + inline;
+          return;
+        }
+
+        // ── While inside Assessment block, collect lines ───────────────────
+        if (inAssessment) {
+          rawAssessment += " " + line;
+          return;
+        }
+
+        // ── Option lines  e.g.  A) text  or  (A) text  or  A. text ─────────
+        const opt = line.match(/^[\(\[]?([A-Da-d])[\)\]\.\s]+(.+)/);
+        if (opt) {
+          options[opt[1].toUpperCase()] = opt[2]
+            .replace(/\*{1,2}/g, "")
+            .trim();
+          return;
+        }
+
+        // ── Answer line  e.g.  Answer: C ──────────────────────────────────
+        const ans = line.match(/^(answer|ans|correct answer)\s*[:\-]\s*([A-Da-d])/i);
+        if (ans) {
+          correct = ans[2].toUpperCase();
+        }
+      });
+
+      return {
+        question,
+        options,
+        answer      : correct,
+        rawAssessment: rawAssessment.trim(),   // raw — will be rewritten below
+      };
+    }).filter(m => m.question && Object.values(m.options).some(Boolean));
+
+    console.log(`🧩 Parsed MCQs: ${parsed.length}`, JSON.stringify(parsed[0] || {}));
+
+    // ── STEP 3: Rewrite each rawAssessment as a plain paragraph ───────────
+    // One LLM call rewrites ALL assessments in one shot (cheaper & faster)
+    if (parsed.length > 0) {
+      let finalParsed = parsed;
+
+      const hasAnyAssessment = parsed.some(m => m.rawAssessment);
+
+      if (hasAnyAssessment) {
+        try {
+          // Build a numbered list of raw assessments for the LLM to rewrite
+          const rawList = parsed
+            .map((m, i) =>
+              `[${i + 1}] Question: "${m.question.substring(0, 80)}"\n` +
+              `    Raw assessment: ${m.rawAssessment || "(none)"}`
+            )
+            .join("\n\n");
+
+          const rewriteMessages = [
+            {
+              role: "system",
+              content: `You are an assessment writer. You will receive a numbered list of MCQ questions and their raw assessments.
+For EACH item, rewrite the assessment as a single, plain, flowing paragraph.
+
+STRICT RULES:
+- Output ONLY the rewritten assessments, one per line, prefixed with the same number: [1] text  [2] text etc.
+- NO bullet points, NO option labels (A/B/C/D), NO asterisks, NO dashes, NO line breaks inside an assessment
+- Each assessment must be ONE continuous paragraph of 2-4 sentences
+- Describe what each answer choice reveals about the person's personality/behavior in one unified paragraph
+- Do NOT include the question text in your output`
+            },
+            {
+              role: "user",
+              content: rawList
+            }
+          ];
+
+          const rewriteCompletion = await groq.chat.completions.create({
+            messages   : rewriteMessages,
+            model      : "llama-3.3-70b-versatile",
+            temperature: 0.3,
+            max_tokens : 800,
+            top_p      : 0.9,
+          });
+
+          const rewriteRaw = rewriteCompletion.choices[0]?.message?.content || "";
+          console.log(`✍️  Rewritten assessments raw: "${rewriteRaw.substring(0, 200)}"`);
+
+          // ── Parse rewrite response: extract [N] paragraph ────────────────
+          // Match patterns like [1] some text [2] more text
+          const rewriteMap = {};
+          const rewriteMatches = [...rewriteRaw.matchAll(/\[(\d+)\]\s*([\s\S]*?)(?=\[\d+\]|$)/g)];
+          rewriteMatches.forEach(m => {
+            const idx  = parseInt(m[1], 10) - 1;   // 0-based
+            const text = m[2]
+              .replace(/\n+/g, " ")                 // flatten newlines
+              .replace(/\*{1,2}/g, "")              // strip markdown bold
+              .replace(/\s{2,}/g, " ")              // collapse spaces
+              .trim();
+            if (text) rewriteMap[idx] = text;
+          });
+
+          // ── Merge rewritten assessments back into parsed objects ──────────
+          finalParsed = parsed.map((m, i) => ({
+            question  : m.question,
+            options   : m.options,
+            answer    : m.answer,
+            assessment: rewriteMap[i] || m.rawAssessment || null,   // fallback to raw
+          }));
+
+          console.log(`✅ Assessment rewrite done. Sample: "${(finalParsed[0]?.assessment || "").substring(0, 100)}"`);
+
+        } catch (rewriteErr) {
+          // Rewrite failed — fall back to raw assessment text
+          console.warn("⚠️ Assessment rewrite LLM failed, using raw:", rewriteErr.message);
+          finalParsed = parsed.map(m => ({
+            question  : m.question,
+            options   : m.options,
+            answer    : m.answer,
+            assessment: m.rawAssessment || null,
+          }));
+        }
+      } else {
+        // No assessment in LLM output at all — save without it
+        finalParsed = parsed.map(m => ({
+          question  : m.question,
+          options   : m.options,
+          answer    : m.answer,
+          assessment: null,
+        }));
+      }
+
+      // ── STEP 4: Save to Mcqs.json ─────────────────────────────────────────
+      saveMcqsToFile(finalParsed, session_id, query);
+      console.log(`💾 Saved ${finalParsed.length} MCQ(s) with assessments`);
+    }
+  }
+} catch (mcqErr) {
+  console.error("⚠️ MCQ save failed:", mcqErr.message);
+  import("./path/to/your/stacktrace").catch(() => console.error(mcqErr));
+}
+// ── END MCQ DETECTION ──────────────────────────────────────────────────────
+
 
     // ── Check if LLM says it needs to search ──────────────────────────────
     const noInfoPhrases = [
@@ -821,9 +994,6 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
 
     const hasNoInfo = noInfoPhrases.some(p => answer.toLowerCase().includes(p));
 
-    // Post-LLM scrape: fire if LLM said it has no info AND it's not a link request.
-    // This is the ONLY place entity mismatch matters now — we let the LLM try first,
-    // and only scrape if it genuinely couldn't answer from the DB context.
     const entityMatch = entityFoundInContext(query, topChunks);
     if ((hasNoInfo || (!entityMatch && !skip_scraping)) && intent !== 'link_request') {
       if (scrapingInProgress.has(scrapingKey)) {
@@ -836,7 +1006,6 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
       console.log("🔍 LLM has no info → triggering scraper");
       scrapingInProgress.set(scrapingKey, Date.now());
 
-      // FIX: User message already saved above, only save assistant status here
       await saveMessage(session_id, "assistant", "🔍 Searching the web...");
 
       triggerScraperWithCallback(query, session_id, scrapingKey);
@@ -857,14 +1026,9 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
     const allLinks    = [...new Set([...answerLinks, ...websiteLinks])];
 
     // ── Save to session cache ──────────────────────────────────────────────
-    // FIX: Only cache links when they are RELEVANT to this query's topic.
-    // For independent/entity_switch intents, this is a new topic — cache its
-    // own fresh links. For follow_up/clarification, keep the previous links
-    // too so "give me the link" after a follow-up still works correctly.
-    // This prevents Ibn al-Nafis links from appearing on water cycle answers.
     const linksToCache = (intent === 'independent' || intent === 'entity_switch')
-      ? allLinks          // fresh topic — only cache this answer's links
-      : [...new Set([...(sessionCache?.links || []), ...allLinks])]; // merge with prior
+      ? allLinks
+      : [...new Set([...(sessionCache?.links || []), ...allLinks])];
 
     sessionAnswerCache.set(session_id, {
       lastTopic : query,
@@ -874,14 +1038,12 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
     });
 
     // ── Save assistant answer ──────────────────────────────────────────────
-    // FIX: User message already saved above — only save assistant here
     await saveMessage(session_id, "assistant", answer);
 
     const elapsed = Date.now() - startTime;
     console.log(`✅ Done in ${elapsed}ms | intent=${intent}`);
     console.log(`${'━'.repeat(50)}\n`);
 
-    // FIX: Always include `answer` field at top level — frontend reads this
     res.json({
       answer,
       sources: topChunks.map((c, i) => ({
@@ -907,7 +1069,6 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
     console.error("❌ UNHANDLED ERROR:", err);
     const key = `${req.body?.session_id}:${req.body?.query?.toLowerCase().trim()}`;
     activeRequests.delete(key);
-    // FIX: Always return `answer` field even on error so frontend doesn't break
     res.status(500).json({
       answer: "An error occurred. Please try again.",
       error: "Internal server error: " + err.message,
@@ -917,6 +1078,41 @@ Do NOT say links are unavailable. Do NOT say "I need to search".`
   }
 };
 
+//use for excel sheet export
+export const exportMcqs = async (req, res) => {
+  try {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname  = path.dirname(__filename);
+    const MCQS_FILE  = path.join(__dirname, "Mcqs.json"); // ← define it here
+
+    if (!fs.existsSync(MCQS_FILE)) {
+      console.log("❌ Mcqs.json not found at:", MCQS_FILE);
+      return res.status(404).json({ error: "No MCQs found. Ask for MCQs first." });
+    }
+
+    const data = JSON.parse(fs.readFileSync(MCQS_FILE, "utf8"));
+    if (!data.mcqs || data.mcqs.length === 0) {
+      return res.status(404).json({ error: "No MCQs found. Ask for MCQs first." });
+    }
+
+    const filePath = await exportMcqsToExcel();
+    if (!filePath) return res.status(404).json({ error: "Export failed." });
+
+    const today    = new Date().toISOString().slice(0, 10);
+    const filename = `MCQS.${today}.xlsx`;
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    const fileStream = fs.createReadStream(filePath);
+    fileStream.pipe(res);
+    fileStream.on("end", () => fs.unlink(filePath, () => {}));
+
+  } catch (err) {
+    console.error("❌ Export error:", err);
+    res.status(500).json({ error: err.message });
+  }
+};
 // ─────────────────────────────────────────────────────────────────────────────
 // SCRAPER TRIGGER
 // ─────────────────────────────────────────────────────────────────────────────
